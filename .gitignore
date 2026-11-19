@@ -19,6 +19,7 @@ __pycache__/
 *.log
 
 # 로컬 환경 설정과 원본 계측 데이터
+/.local/
 .env
 .env.local
 /logs/
