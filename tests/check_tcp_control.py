@@ -109,6 +109,7 @@ class ControlMockTest(unittest.TestCase):
         self.assertEqual(
             self.request(conn, wire, stream)["reason"], "HEARTBEAT_REQUIRED"
         )
+
         with FIXTURE.with_name("tcp-qt-to-backend.jsonl").open("rb") as fixture:
             heartbeat, request = (read_message(fixture) for _ in range(2))
         with FIXTURE.open("rb") as fixture:
@@ -118,6 +119,7 @@ class ControlMockTest(unittest.TestCase):
         for message in (heartbeat, request):
             message["data"]["stream_id"] = stream
         request_id = request["data"]["request_id"]
+
         heartbeat_line = encode(heartbeat["type"], **heartbeat["data"])
         conn.sendall(heartbeat_line[:7])
         self.wait_message(
@@ -125,18 +127,21 @@ class ControlMockTest(unittest.TestCase):
         )
         conn.sendall(heartbeat_line[7:] + encode(request["type"], **request["data"]))
         self.assertEqual(self.wait_message(wire, "control_result"), expected_result)
+
         for _ in range(4):
             conn.sendall(heartbeat_line)
             active = self.wait_message(
                 wire, "snapshot", lambda data: data["motor"]["state"] == "TEST_ARMED"
             )
             self.assertTrue(active["operator"]["controls_ready"])
+
         duplicate = self.request(conn, wire, stream, request_id=request_id)
         self.assertEqual(duplicate["status"], "COMPLETED")
         self.assertEqual(
             self.request(conn, wire, stream, "STOP", request_id=request_id)["reason"],
             "REQUEST_ID_CONFLICT",
         )
+
         conn.sendall(encode("control_heartbeat", stream_id=str(uuid.uuid4())))
         expired = self.wait_message(
             wire, "snapshot", lambda data: data["operator"]["link"] == "stale"
@@ -151,10 +156,12 @@ class ControlMockTest(unittest.TestCase):
             wire, "snapshot", lambda data: data["operator"]["link"] == "stale"
         )
         self.assertEqual(stopped["motor"]["state"], "STOPPED")
+
         conn.sendall(heartbeat_line)
         rearmed = self.request(conn, wire, stream)
         self.assertEqual(rearmed["status"], "COMPLETED")
         self.assertEqual(rearmed["cmd_seq"], expected_result["cmd_seq"] + 1)
+
         wire.close()
         conn.close()
         conn, wire, new_stream = self.connect()

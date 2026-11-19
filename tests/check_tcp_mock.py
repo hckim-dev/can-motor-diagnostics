@@ -23,6 +23,7 @@ def read_message(stream):
         raise ValueError(
             "Expected a complete LF-terminated TCP message within 16384 bytes"
         )
+
     message = json.loads(line.decode("utf-8"), parse_constant=reject_constant)
     if not isinstance(message, dict):
         raise ValueError("Expected a JSON object")
@@ -48,12 +49,14 @@ def check_stream(
             if reconnect:
                 return None
             raise
+
         stream_id = uuid.UUID(hello["stream_id"])
         backend_session = uuid.UUID(hello["data"]["backend_session"])
         expected_hello = {**hello_data, "backend_session": str(backend_session)}
         previous_ms = -1
         first_snapshot_ms = None
         start = time.monotonic()
+
         for seq in range(snapshot_count + 1):
             message = hello if seq == 0 else read_message(stream)
             expected_type = "hello" if seq == 0 else "snapshot"
@@ -74,6 +77,7 @@ def check_stream(
                 == json.dumps(expected_data, sort_keys=True),
                 f"Unexpected {expected_type} data",
             )
+
             mono_ms = message["mono_ms"]
             require(
                 type(mono_ms) is int and mono_ms >= 0 and mono_ms >= previous_ms,
@@ -102,6 +106,7 @@ def check_stream(
         print(
             f"{snapshot_count} snapshots: sent in {sent_seconds:.3f}s, received in {received_seconds:.3f}s"
         )
+
     return stream_id, backend_session
 
 
@@ -114,9 +119,11 @@ def main():
         with FIXTURE.open("rb") as fixture:
             hello_data = read_message(fixture)["data"]
             snapshot_data = read_message(fixture)["data"]
+
         stream_id, session = check_stream(
             args.host, args.port, hello_data, snapshot_data, 11
         )
+
         deadline = time.monotonic() + 1
         while True:
             result = check_stream(

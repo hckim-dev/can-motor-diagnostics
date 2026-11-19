@@ -87,6 +87,7 @@ class ControlSession:
         )
         link = "offline" if age_ms is None else ("fresh" if ready else "stale")
         state = "TEST_ARMED" if self.armed else "STOPPED"
+
         return {
             **SNAPSHOT,
             "motor": {**SNAPSHOT["motor"], "state": state},
@@ -112,6 +113,7 @@ class ControlSession:
         if not isinstance(request_id, str):
             raise ValueError("요청 식별자는 UUID 문자열이어야 한다")
         key = uuid.UUID(request_id)
+
         result = {
             "request_id": request_id,
             "status": "REJECTED",
@@ -129,6 +131,7 @@ class ControlSession:
             sort_keys=True,
             allow_nan=False,
         )
+
         requests = self.control.requests
         cached = requests.get(key)
         if cached is not None:
@@ -161,6 +164,7 @@ class ControlSession:
                 motor_epoch=SNAPSHOT["motor"]["epoch"],
                 cmd_seq=next(self.control.command_sequences),
             )
+
         result["reason"] = reason
         requests[key] = RequestRecord(self.stream_id, payload, result)
         return result
