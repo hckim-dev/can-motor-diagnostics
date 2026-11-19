@@ -10,11 +10,13 @@
 
 ### Qt와 backend
 
-서버 `hello`가 현재 `stream_id`와 `hello.data.protocol` 값 `"2.1"`을 보냅니다. Qt는 현재 `stream_id`로 `control_heartbeat`와 `control_request`를 보냅니다. 요청은 `request_id`로 식별하며 서버는 `control_result`로 처리 결과를 반환합니다. Qt는 처리 결과와 실제 MCU 상태 스냅샷을 각각 표시합니다. 응답 유실 시 구동 명령을 자동 재시도하지 않습니다.
+서버는 연결 직후 `hello`(`stream_seq=0`), 현재 `snapshot` 순으로 보내고 이후 10Hz로 스냅샷을 보냅니다. `hello`에는 현재 `stream_id`와 `hello.data.protocol` 값 `"2.1"`이 들어갑니다. Qt는 현재 `stream_id`로 `control_heartbeat`와 `control_request`를 보냅니다. 요청은 `request_id`로 식별하며 서버는 `control_result`로 처리 결과를 반환합니다. Qt는 처리 결과와 실제 MCU 상태 스냅샷을 각각 표시합니다. 응답 유실 시 구동 명령을 자동 재시도하지 않습니다.
 
 ### backend와 모터 STM32
 
 backend가 `OP_HELLO`(`0x701`), `OP_PERMIT`(`0x080`), `COMMAND`(`0x100`)를 전송합니다. 양측 HELLO 버전은 `2.1`이며 `2.0`에는 운전 허가를 부여하지 않습니다. `OP_PERMIT`의 b0은 제어 준비, b2는 출력 억제 요청이며 기본 구성의 b1·b3·b4는 0입니다. NC2는 `MOTOR_HELLO.capabilities` b4와 `MOTOR_STATE.status_flags` b7을 통해 보고합니다.
+
+backend는 `COMMAND_RESULT`(`0x110`)의 `request_epoch`와 `cmd_seq`를 보낸 명령에 대조합니다. `MOTOR_STATE`(`0x200`)는 별도로 현재 상태를 갱신합니다. 공통 예제의 `ARM_TEST`는 opcode 4, 인자 0이며, 수락과 실행이 완료된 경우 결과와 상태에 `TEST_ARMED`가 나타납니다.
 
 초기 제안값은 Qt heartbeat 100ms 주기·300ms 만료, CAN 허가 50ms 주기·모터 수신 기준 200ms 만료입니다. Qt 연결 종료를 감지하거나 heartbeat가 만료되면 backend는 신규 운전 요청을 차단하고 허가를 철회합니다. 재연결과 새 heartbeat는 운전 요청을 대신하지 않습니다.
 

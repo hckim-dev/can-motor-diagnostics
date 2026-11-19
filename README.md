@@ -19,6 +19,6 @@ Basys3 → 시험 A/B → MUX → 모터 STM32
 | [fpga/](fpga/) | Basys3 시험 파형, GPIO 응답 시간 측정, UART 전송 |
 | [tests/fixtures/](tests/fixtures/) | 부품 간 송수신을 검증하는 공통 입력 예제 |
 
-먼저 [시스템 구조](docs/architecture.md)와 [통신 규격](docs/protocol.md)을 확인하세요. 개발과 통합은 [단계별 합격 기준](docs/integration.md)을 따릅니다. 프레임이나 상태 전이를 바꾸는 PR에서는 관련 문서와 예제를 함께 갱신하고, 송신·수신 담당자가 함께 검토합니다.
+먼저 [시스템 구조](docs/architecture.md)와 [통신 규격](docs/protocol.md)을 확인하고, 팀에서 공유한 CAN DO 시스템 설계서 v1.5의 상세 표를 함께 참고하세요. 개발과 통합은 [단계별 합격 기준](docs/integration.md)을 따릅니다. 프레임이나 상태 전이를 바꾸는 PR에서는 관련 문서와 예제를 함께 갱신하고, 송신·수신 담당자가 함께 검토합니다.
 
 현재 저장소에는 작업 골격, 설계 기준, 입력 예제가 있습니다. 각 영역에 구현이 추가되면 해당 README에 도구 버전과 빌드·실행 방법을 기록합니다.
