@@ -5,7 +5,7 @@ import json
 import unittest
 from pathlib import Path
 from struct import pack
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from backend.can_rx.codec import CanId, Frame, InvalidFrame, decode_frame
 from backend.can_rx.fixture import feed_frames, load_frames
@@ -44,17 +44,28 @@ def timing(seq, tick, boot=BOOT):
 
 class DecodeTest(unittest.TestCase):
     def test_shared_can_frames(self):
-        records = (json.loads(line) for line in (FIXTURES / "can-2.1.jsonl").read_text().splitlines())
+        records = (
+            json.loads(line)
+            for line in (FIXTURES / "can-2.1.jsonl").read_text().splitlines()
+        )
         messages = [
-            decode_frame(Frame(int(row["can_id"], 16), bytes.fromhex(row["hex"]), row["dlc"]))
+            decode_frame(
+                Frame(int(row["can_id"], 16), bytes.fromhex(row["hex"]), row["dlc"])
+            )
             for row in records
         ]
-        operator, motor, initial, fault_msg, permit, arm, result, armed, revoke = messages
+        operator, motor, initial, fault_msg, permit, arm, result, armed, revoke = (
+            messages
+        )
         self.assertEqual(operator.version, motor.version)
         self.assertEqual(motor.version, (2, 1))
-        self.assertEqual((motor.epoch, initial.state.name, fault_msg.mask), (EPOCH, "STOPPED", 0))
+        self.assertEqual(
+            (motor.epoch, initial.state.name, fault_msg.mask), (EPOCH, "STOPPED", 0)
+        )
         self.assertEqual((permit.flags, arm.opcode, arm.argument), (1, 4, 0))
-        self.assertEqual((result.request_epoch, result.cmd_seq, result.result), (EPOCH, 1, 1))
+        self.assertEqual(
+            (result.request_epoch, result.cmd_seq, result.result), (EPOCH, 1, 1)
+        )
         self.assertEqual((armed.state.name, revoke.flags), ("TEST_ARMED", 4))
 
     def test_signed_sentinel_and_electric_mode(self):
@@ -62,8 +73,10 @@ class DecodeTest(unittest.TestCase):
         self.assertIsNone(decode_frame(speed(1, rpm=-32768, pwm=65535)).actual_rpm)
         old = decode_frame(electric(1, current=-32768, flags=0x1A, age=15))
         self.assertIsNone(old.current_ma)
-        self.assertEqual((old.bus_mv, old.mode.name, old.state.name, old.sensor_age_ms),
-                         (6000, "TEST", "STOPPED", 150))
+        self.assertEqual(
+            (old.bus_mv, old.mode.name, old.state.name, old.sensor_age_ms),
+            (6000, "TEST", "STOPPED", 150),
+        )
 
     def test_invalid_frames_and_unknown_id(self):
         for frame in (
@@ -71,9 +84,14 @@ class DecodeTest(unittest.TestCase):
             Frame(CanId.MOTOR_STATE, b"\0" * 8, extended=True),
             Frame(CanId.MOTOR_STATE, b"\0" * 8, rtr=True),
             Frame(CanId.MOTOR_STATE, b"\0" * 8, error=True),
-            hello(capabilities=0x80), state(mode=9), fault(mask=0x200),
-            speed(1, pwm=1001), electric(1, current=-32768), electric(1, age=255),
-            electric(1, flags=0x80), timing(1, 0, boot=0),
+            hello(capabilities=0x80),
+            state(mode=9),
+            fault(mask=0x200),
+            speed(1, pwm=1001),
+            electric(1, current=-32768),
+            electric(1, age=255),
+            electric(1, flags=0x80),
+            timing(1, 0, boot=0),
         ):
             with self.subTest(frame=frame), self.assertRaises(InvalidFrame):
                 decode_frame(frame)
@@ -96,7 +114,10 @@ class ReceiveTest(unittest.TestCase):
     def test_initial_state_and_version(self):
         self.ingest(0, state(), fault())
         initial = self.snapshot(0)
-        self.assertEqual((initial["motor"]["state"], initial["motor"]["link"]), ("UNKNOWN", "offline"))
+        self.assertEqual(
+            (initial["motor"]["state"], initial["motor"]["link"]),
+            ("UNKNOWN", "offline"),
+        )
         self.assertIsNone(initial["motor"]["fault_mask"])
 
         self.ingest(5, hello(version=(2, 0), capabilities=0x0F), state())
@@ -109,13 +130,37 @@ class ReceiveTest(unittest.TestCase):
         self.ingest(12, hello())
         self.assertEqual(self.snapshot(12)["motor"]["state"], "UNKNOWN")
 
+    def test_incompatible_hello_cannot_advance_control_session(self):
+        operator = Frame(CanId.OP_HELLO, pack("<IBBBB", 1, 2, 1, 0, 0))
+        permit = Frame(CanId.OP_PERMIT, pack("<IHBB", EPOCH, 1, 1, 0))
+        self.ingest(0, hello(), state(), operator, permit)
+        self.assertTrue(self.snapshot(0)["operator"]["controls_ready"])
+
+        unsupported_motor = hello(EPOCH + 5, version=(2, 0), capabilities=0x0F)
+        unsupported_operator = Frame(CanId.OP_HELLO, pack("<IBBBB", 5, 2, 0, 0, 0))
+        self.ingest(10, unsupported_motor, unsupported_operator, permit)
+        invalid = self.snapshot(10)
+        self.assertEqual(invalid["motor"]["state"], "UNKNOWN")
+        self.assertIsNone(invalid["operator"]["controls_ready"])
+
+        next_epoch = EPOCH + 1
+        restarted = Frame(CanId.OP_HELLO, pack("<IBBBB", 2, 2, 1, 0, 0))
+        next_permit = Frame(CanId.OP_PERMIT, pack("<IHBB", next_epoch, 1, 1, 0))
+        self.ingest(11, restarted, hello(next_epoch), state(next_epoch), next_permit)
+        self.ingest(12, hello(), operator, permit)
+        recovered = self.snapshot(12)
+        self.assertEqual(recovered["motor"]["epoch"], next_epoch)
+        self.assertTrue(recovered["operator"]["controls_ready"])
+
     def test_independent_expiry_and_bad_frame_cannot_refresh(self):
         self.ingest(0, hello(), state(flags=0x80), fault(mask=4, seq=1))
         self.ingest(10, speed(42), electric(42, age=15), timing(42, 100))
         self.assertIsNotNone(self.snapshot(60)["motor"]["sample"]["bus_mv"])
         reading = self.snapshot(61)["motor"]["sample"]
-        self.assertEqual((reading["actual_rpm"], reading["bus_mv"], reading["sensor_age_ms"]),
-                         (59, None, 201))
+        self.assertEqual(
+            (reading["actual_rpm"], reading["bus_mv"], reading["sensor_age_ms"]),
+            (59, None, 201),
+        )
 
         self.ingest(299, state(mode=9))
         aged = self.snapshot(300)
@@ -134,10 +179,14 @@ class ReceiveTest(unittest.TestCase):
         records = self.ingest(10, speed(12), timing(12, 50))
         self.assertIsNone(self.snapshot(109)["motor"]["sample"]["seq"])
         partial = self.snapshot(110)["motor"]["sample"]
-        self.assertEqual((partial["seq"], partial["actual_rpm"], partial["sample_complete"]),
-                         (12, 59, False))
+        self.assertEqual(
+            (partial["seq"], partial["actual_rpm"], partial["sample_complete"]),
+            (12, 59, False),
+        )
         self.assertIsNone(partial["bus_mv"])
-        self.assertEqual(self.rx.samples.latest.evidence_ids, tuple(row.record_id for row in records))
+        self.assertEqual(
+            self.rx.samples.latest.evidence_ids, tuple(row.record_id for row in records)
+        )
 
         self.ingest(111, electric(12))
         self.assertFalse(self.snapshot(111)["motor"]["sample"]["sample_complete"])
@@ -148,7 +197,10 @@ class ReceiveTest(unittest.TestCase):
         self.ingest(0, hello(), speed(1), electric(1))
         self.assertIsNone(self.snapshot(100)["motor"]["sample"]["seq"])
         observations = self.ingest(
-            110, timing(2, 50), speed(2, rpm=-1), electric(2, current=-32768),
+            110,
+            timing(2, 50),
+            speed(2, rpm=-1),
+            electric(2, current=-32768),
         )
         self.assertIsNone(self.snapshot(209)["motor"]["sample"]["seq"])
         reading = self.snapshot(210)["motor"]["sample"]
@@ -179,7 +231,9 @@ class ReceiveTest(unittest.TestCase):
         self.sample(1, 1, 1)
         old_acquisition = self.rx.samples.latest.acquisition_id
         new_epoch = 0x00020001
-        self.ingest(10, timing(1, 10, boot=2), hello(new_epoch), hello(), state(new_epoch))
+        self.ingest(
+            10, timing(1, 10, boot=2), hello(new_epoch), hello(), state(new_epoch)
+        )
         self.sample(309, 1, 10, boot=2)
         self.assertIsNone(self.snapshot(309)["motor"]["sample"]["seq"])
         self.ingest(310, timing(1, 310, boot=1))
@@ -225,14 +279,24 @@ class ReceiveTest(unittest.TestCase):
                 self.ingest(recovered_ms, hello(), fault(mask=4, seq=254))
                 self.assertIsNone(self.snapshot(recovered_ms)["motor"]["fault_mask"])
                 self.ingest(recovered_ms + 1, fault(mask=4, seq=255))
-                self.assertIsNone(self.snapshot(recovered_ms + 1)["motor"]["fault_mask"])
+                self.assertIsNone(
+                    self.snapshot(recovered_ms + 1)["motor"]["fault_mask"]
+                )
                 self.ingest(recovered_ms + 2, fault(mask=0, seq=255))
-                self.assertEqual(self.snapshot(recovered_ms + 2)["motor"]["fault_mask"], 0)
+                self.assertEqual(
+                    self.snapshot(recovered_ms + 2)["motor"]["fault_mask"], 0
+                )
                 self.ingest(recovered_ms + 3, fault(mask=4, seq=0))
-                self.assertEqual(self.snapshot(recovered_ms + 3)["motor"]["fault_mask"], 4)
+                self.assertEqual(
+                    self.snapshot(recovered_ms + 3)["motor"]["fault_mask"], 4
+                )
 
-                self.ingest(recovered_ms + 4, hello(EPOCH + 1), fault(EPOCH + 1, seq=255))
-                self.assertEqual(self.snapshot(recovered_ms + 4)["motor"]["fault_mask"], 0)
+                self.ingest(
+                    recovered_ms + 4, hello(EPOCH + 1), fault(EPOCH + 1, seq=255)
+                )
+                self.assertEqual(
+                    self.snapshot(recovered_ms + 4)["motor"]["fault_mask"], 0
+                )
 
     def test_old_boot_timing_drops_unanchored_measurements(self):
         self.ingest(0, hello())
@@ -320,7 +384,8 @@ class ReceiveTest(unittest.TestCase):
         self.assertTrue(reading["sample_complete"])
         self.assertTrue(all(row.error for row in rejected))
         self.assertEqual(
-            self.rx.samples.latest.evidence_ids, tuple(row.record_id for row in accepted)
+            self.rx.samples.latest.evidence_ids,
+            tuple(row.record_id for row in accepted),
         )
 
     def test_timed_fixture_projects_decoded_measurements(self):
@@ -330,7 +395,12 @@ class ReceiveTest(unittest.TestCase):
         self.assertEqual(snap["motor"]["mode"], "REAL")
         reading = snap["motor"]["sample"]
         self.assertEqual(
-            (reading["actual_rpm"], reading["pwm_permille"], reading["current_ma"], reading["quality"]),
+            (
+                reading["actual_rpm"],
+                reading["pwm_permille"],
+                reading["current_ma"],
+                reading["quality"],
+            ),
             (59, 450, 250, "valid"),
         )
 
@@ -345,30 +415,39 @@ class TcpCanTest(unittest.IsolatedAsyncioTestCase):
     async def test_feeder_failure_reaches_server(self):
         stop = asyncio.Event()
         failing_feed = AsyncMock(side_effect=RuntimeError("예제 입력 실패"))
-        with patch("backend.tcp_mock.feed_frames", failing_feed):
-            with self.assertRaisesRegex(RuntimeError, "예제 입력 실패"):
-                await asyncio.wait_for(wait_for_stop(stop, [], CanReceiver()), 1)
+        with self.assertRaisesRegex(RuntimeError, "예제 입력 실패"):
+            await asyncio.wait_for(wait_for_stop(stop, failing_feed), 1)
 
     async def test_fixture_to_tcp_and_expiry(self):
         mock = TcpMock(can_input=True)
         entries = load_frames(FIXTURES / "can-rx-timed.jsonl")
-        async with await asyncio.start_server(mock.handle_client, "127.0.0.1", 0) as server:
+        async with await asyncio.start_server(
+            mock.handle_client, "127.0.0.1", 0
+        ) as server:
             host, port = server.sockets[0].getsockname()
             reader, writer = await asyncio.open_connection(host, port)
             try:
                 hello_msg = await self.read(reader)
-                self.assertEqual((hello_msg["type"], hello_msg["source"]), ("hello", "mock"))
+                self.assertEqual(
+                    (hello_msg["type"], hello_msg["source"]), ("hello", "mock")
+                )
                 initial = (await self.read(reader))["data"]
                 self.assertEqual(initial["motor"]["state"], "UNKNOWN")
                 self.assertIsNone(initial["motor"]["sample"]["actual_rpm"])
 
                 await feed_frames(entries, mock.can_receiver)
-                current = await self.wait_motor(reader, lambda motor: motor["sample"]["sample_complete"])
-                self.assertEqual((current["mode"], current["state"]), ("REAL", "RUNNING"))
+                current = await self.wait_motor(
+                    reader, lambda motor: motor["sample"]["sample_complete"]
+                )
+                self.assertEqual(
+                    (current["mode"], current["state"]), ("REAL", "RUNNING")
+                )
                 self.assertEqual(current["sample"]["actual_rpm"], 59)
                 self.assertEqual(current["sample"]["bus_mv"], 6000)
 
-                expired = await self.wait_motor(reader, lambda motor: motor["state"] == "UNKNOWN")
+                expired = await self.wait_motor(
+                    reader, lambda motor: motor["state"] == "UNKNOWN"
+                )
                 self.assertEqual(expired["fault_mask"], 0)
                 self.assertIsNone(expired["sample"]["bus_mv"])
             finally:

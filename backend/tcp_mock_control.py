@@ -53,7 +53,16 @@ SNAPSHOT = {
 class RequestRecord:
     stream_id: str
     payload: str
-    result: dict
+    result: dict | None
+
+
+def request_payload(data):
+    # 거부된 요청도 비교할 수 있도록 값의 형식과 필드 누락을 구분한다.
+    return json.dumps(
+        {name: data[name] for name in ("opcode", "argument") if name in data},
+        sort_keys=True,
+        allow_nan=False,
+    )
 
 
 class MockControl:
@@ -125,12 +134,7 @@ class ControlSession:
             return result
 
         opcode, argument = data.get("opcode"), data.get("argument")
-        # 거부된 요청도 비교할 수 있도록 값의 형식과 필드 누락을 구분한다.
-        payload = json.dumps(
-            {name: data[name] for name in ("opcode", "argument") if name in data},
-            sort_keys=True,
-            allow_nan=False,
-        )
+        payload = request_payload(data)
 
         requests = self.control.requests
         cached = requests.get(key)

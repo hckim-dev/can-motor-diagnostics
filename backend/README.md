@@ -35,3 +35,13 @@ CAN 수신 목업은 `python3 backend/tcp_mock.py --can-fixture tests/fixtures/c
 조작 노드의 새 부팅 ID를 관측하면 이후 더 큰 모터 epoch를 알리는 `MOTOR_HELLO`와 그 epoch의 유효한 `OP_PERMIT`가 모두 들어올 때까지 허가를 미확인으로 표시합니다.
 
 `python3 -X dev -W error -m unittest discover -s tests -p 'check_can_rx.py' -v`로 디코딩, 상태, TCP 스냅샷을 검증합니다.
+
+모의 CAN 조작은 저장소 루트에서 `python3 -m backend.tcp_can_mock`로 실행합니다. 기본 모드는 TEST이며, `--motor-mode REAL`은 가상 모터에서만 `START_REAL`을 확인하는 옵션입니다. `--boot-id-file`의 기본 경로는 `.local/can-mock-boot-id`이며, 서버를 시작할 때마다 증가한 부팅 ID를 저장합니다.
+
+`can_control/wire.py`는 송신 바이트를 구성하고, `can_control/controller.py`는 명령·허가·타임아웃을 관리합니다. `can_control/mock_motor.py`는 메모리 버스와 가상 모터를 제공하며, `tcp_can_mock.py`는 TCP 요청과 비동기 CAN 결과를 연결합니다.
+
+제어기는 입력 시각의 만료를 먼저 처리합니다. CAN 프레임을 수신하면 디코딩과 수신 검증을 거친 뒤 epoch와 허가 상태를 재평가하고, 명령 결과를 대기 요청에 연결합니다. CAN 단절 시에는 이전 억제 송신의 확인 기준을 폐기합니다. 재연결 후 새 억제 송신과 정지 관측을 거쳐야 허가가 복구됩니다.
+
+모의 CAN은 허가를 50ms마다 보내고, 조작 heartbeat가 300ms 동안 없으면 대기 명령을 취소하고 출력 억제를 요청합니다. 명령의 송신 대기 50ms와 송신 후 결과 대기 300ms는 별개입니다. 명령 송신은 모의 버스 주기에서 처리합니다. 주기 전에 STOP이나 연결 단절이 들어오면 대기 명령을 취소하고, 버스가 연결된 경우 다음 주기에 출력 억제 프레임을 보냅니다. 모의 환경에서는 억제 송신 후 더 큰 epoch의 최신 `STOPPED` 또는 `FAULT`를 확인해야 새 운전 허가를 내보냅니다. 이 규칙과 실제 어댑터의 프레임 취소 범위는 실물 연결 전 별도로 확인합니다.
+
+`python3 -X dev -W error -m unittest discover -s tests -p 'check_can_control.py' -v`로 모의 CAN과 TCP 조작을 검증합니다.

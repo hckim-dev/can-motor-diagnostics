@@ -164,6 +164,9 @@ class CanReceiver:
         if message.epoch < max(self.highest_epoch, self.required_epoch):
             return
 
+        epoch_changed = (
+            message.version == VERSION and message.epoch != self.highest_epoch
+        )
         old_boot = self.highest_epoch >> 16
         continuity_lost = old_boot and (
             not fresh(self.hello, now_ns, HELLO_LIFETIME)
@@ -172,9 +175,10 @@ class CanReceiver:
         )
 
         # 같은 부팅의 epoch 변경은 제어 상태만 초기화한다.
-        if message.epoch != self.highest_epoch or continuity_lost:
+        if epoch_changed or continuity_lost:
             self.state = self.fault = self.permit = None
-        if message.epoch != self.highest_epoch:
+        if epoch_changed:
+            self.highest_epoch = message.epoch
             self.last_fault = None
             self.permit_seq = None
             self.last_state_ns = self.last_permit_ns = None
@@ -182,7 +186,6 @@ class CanReceiver:
             self.samples.reset()
             self.quarantine_until = now_ns + BOOT_QUARANTINE
 
-        self.highest_epoch = message.epoch
         self.hello = received
 
     def accept_motor_status(self, received):
@@ -211,17 +214,17 @@ class CanReceiver:
         message = received.message
         if message.boot_id < self.highest_operator_boot:
             return
-        if message.boot_id != self.highest_operator_boot:
+        if message.version == VERSION and message.boot_id != self.highest_operator_boot:
             if self.highest_operator_boot:
                 # 조작 노드 재부팅을 관측하면 모터가 새 epoch를 알릴 때까지 기다린다.
                 self.epoch_at_operator_restart = self.highest_epoch
             self.permit = None
             self.permit_seq = None
             self.last_permit_ns = None
+            self.highest_operator_boot = message.boot_id
         if message.version != VERSION or not self.operator_known(received.rx_mono_ns):
             # HELLO가 복구돼도 만료 전 허가를 다시 사용하지 않는다.
             self.permit = None
-        self.highest_operator_boot = message.boot_id
         self.operator_hello = received
 
     def accept_permit(self, received):

@@ -8,6 +8,13 @@ VERSION = (2, 1)
 DLC = 8
 SIGNED_MISSING = -32768
 UNSIGNED_MISSING = 65535
+OP_LINK_VALID = 1 << 0
+SUPPLY_PRESENT = 1 << 1
+SUPPLY_VALID = 1 << 2
+DIAG_FAULT_OUTPUT = 1 << 3
+TEST_READY_OUTPUT = 1 << 4
+ENCODER_CALIBRATED = 1 << 5
+OPERATING_CONFIG_VALID = 1 << 6
 
 
 class CanId(IntEnum):
@@ -41,6 +48,9 @@ class State(IntEnum):
     TEST_ARMED = 3
     TEST_ACTIVE = 4
     FAULT = 5
+
+
+STOP_STATES = (State.STOPPED, State.FAULT)
 
 
 @dataclass(frozen=True)

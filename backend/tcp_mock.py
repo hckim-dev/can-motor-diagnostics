@@ -3,9 +3,11 @@
 import argparse
 import asyncio
 import json
+import logging
 import signal
 import time
 import uuid
+from functools import partial
 from pathlib import Path
 
 if __package__:
@@ -25,6 +27,8 @@ PORT = 5000
 MAX_LINE_BYTES = 16_384
 SNAPSHOT_INTERVAL = 0.1
 WRITE_TIMEOUT = 2.0
+CONTROL_TYPES = ("control_heartbeat", "control_request")
+LOGGER = logging.getLogger(__name__)
 
 
 def reject_constant(value):
@@ -40,7 +44,7 @@ def decode_control_message(line):
         raise ValueError("TCP 스키마 오류")
     kind = message.get("type")
     data = message.get("data")
-    if kind not in ("control_heartbeat", "control_request") or not isinstance(data, dict):
+    if not isinstance(kind, str) or not kind or not isinstance(data, dict):
         raise ValueError("제어 메시지 형식 오류")
 
     return kind, data
@@ -73,6 +77,12 @@ class TcpMock:
 
         return session.snapshot(now) if session else SNAPSHOT
 
+    def pending_results(self, session):
+        return ()
+
+    def client_disconnected(self, session):
+        pass
+
     async def handle_client(self, reader, writer):
         if self.stopping or self.client is not None:
             writer.transport.abort()
@@ -81,6 +91,7 @@ class TcpMock:
         self.client = writer
         stream_id = str(uuid.uuid4())
         seq = 0
+        session = None
 
         async def send(kind, data):
             nonlocal seq
@@ -131,6 +142,8 @@ class TcpMock:
         finally:
             writer.transport.abort()
             self.client = None
+            if session is not None:
+                self.client_disconnected(session)
 
     async def stream_snapshots(self, reader, send, session):
         read = reader.readline if session else lambda: reader.read(1)
@@ -157,7 +170,11 @@ class TcpMock:
                         if not line or session is None:
                             break
                         kind, data = decode_control_message(line)
-                        result = session.handle(kind, data, now)
+                        result = None
+                        if kind in CONTROL_TYPES:
+                            result = session.handle(kind, data, now)
+                        else:
+                            LOGGER.debug("지원하지 않는 TCP 메시지 타입: %.80r", kind)
                     except (ValueError, RecursionError):
                         break
                     if result is not None:
@@ -168,6 +185,8 @@ class TcpMock:
                 if now >= next_snapshot:
                     if session:
                         session.expire(now)
+                        for result in self.pending_results(session):
+                            await send("control_result", result)
                     await send("snapshot", self.snapshot(session, now))
                     next_snapshot = now + SNAPSHOT_INTERVAL
         finally:
@@ -175,29 +194,28 @@ class TcpMock:
             await asyncio.gather(read_task, return_exceptions=True)
 
 
-async def wait_for_stop(stop, can_frames, can_receiver):
-    if can_frames is None:
+async def wait_for_stop(stop, background):
+    if background is None:
         await stop.wait()
         return
 
-    feeder = asyncio.create_task(feed_frames(can_frames, can_receiver))
+    worker = asyncio.create_task(background())
     shutdown = asyncio.create_task(stop.wait())
 
     try:
         done, _ = await asyncio.wait(
-            (feeder, shutdown), return_when=asyncio.FIRST_COMPLETED
+            (worker, shutdown), return_when=asyncio.FIRST_COMPLETED
         )
-        if feeder in done:
-            feeder.result()
+        if worker in done:
+            worker.result()
         await shutdown
     finally:
-        for task in (feeder, shutdown):
+        for task in (worker, shutdown):
             task.cancel()
-        await asyncio.gather(feeder, shutdown, return_exceptions=True)
+        await asyncio.gather(worker, shutdown, return_exceptions=True)
 
 
-async def serve(host, port, control=False, can_frames=None):
-    mock = TcpMock(control, can_input=can_frames is not None)
+async def run_tcp_server(mock, host, port, background=None):
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -212,9 +230,19 @@ async def serve(host, port, control=False, can_frames=None):
         addresses = ", ".join(str(sock.getsockname()) for sock in server.sockets)
         print(f"CAN DO TCP mock listening on {addresses}", flush=True)
         try:
-            await wait_for_stop(stop, can_frames, mock.can_receiver)
+            await wait_for_stop(stop, background)
         finally:
             mock.close()
+
+
+async def serve(host, port, control=False, can_frames=None):
+    mock = TcpMock(control, can_input=can_frames is not None)
+    background = (
+        partial(feed_frames, can_frames, mock.can_receiver)
+        if can_frames is not None
+        else None
+    )
+    await run_tcp_server(mock, host, port, background)
 
 
 def main():
@@ -222,10 +250,10 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=PORT)
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--control", action="store_true", help="조작 목업을 활성화한다.")
     mode.add_argument(
-        "--control", action="store_true", help="조작 목업을 활성화한다."
+        "--can-fixture", type=Path, help="시간순 CAN 입력 예제를 사용한다."
     )
-    mode.add_argument("--can-fixture", type=Path, help="시간순 CAN 입력 예제를 사용한다.")
     args = parser.parse_args()
 
     try:
