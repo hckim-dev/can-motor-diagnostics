@@ -45,3 +45,17 @@ CAN 수신 목업은 `python3 backend/tcp_mock.py --can-fixture tests/fixtures/c
 모의 CAN은 허가를 50ms마다 보내고, 조작 heartbeat가 300ms 동안 없으면 대기 명령을 취소하고 출력 억제를 요청합니다. 명령의 송신 대기 50ms와 송신 후 결과 대기 300ms는 별개입니다. 명령 송신은 모의 버스 주기에서 처리합니다. 주기 전에 STOP이나 연결 단절이 들어오면 대기 명령을 취소하고, 버스가 연결된 경우 다음 주기에 출력 억제 프레임을 보냅니다. 모의 환경에서는 억제 송신 후 더 큰 epoch의 최신 `STOPPED` 또는 `FAULT`를 확인해야 새 운전 허가를 내보냅니다. 이 규칙과 실제 어댑터의 프레임 취소 범위는 실물 연결 전 별도로 확인합니다.
 
 `python3 -X dev -W error -m unittest discover -s tests -p 'check_can_control.py' -v`로 모의 CAN과 TCP 조작을 검증합니다.
+
+## FPGA UART 수신
+
+CAN DO 설계서 v1.5 C8의 22바이트 프레임을 수신합니다. `fpga_uart/codec.py`가 CRC와 필드를 검사하고, `stream.py`가 분할 수신 및 CRC 오류 이후의 프레임 경계를 복원합니다. `session.py`는 연결마다 UUID를 발급하고 `(fpga_session, run_seq)`로 시험 회차를 추적합니다. 순번 공백·CRC 오류·FPGA overflow를 관측한 회차는 이후 `STATUS`가 와도 오류 기록을 유지합니다. 역행으로 세션이 모호해지면 다음 명시적 연결 또는 리셋까지 회차 입력을 보류합니다.
+
+```sh
+python3 -m backend.fpga_uart --hex tests/fixtures/fpga-uart-1.0.hex
+python3 -m backend.fpga_uart path/to/capture.bin
+python3 -X dev -W error -m unittest discover -s tests -p 'check_fpga_uart.py' -v
+```
+
+검증 CLI는 디코딩 결과·오류·관측된 회차를 JSON 줄로 출력합니다. 공통 예제는 `INJECT` 한 프레임이라 `MISSING_BASELINE`이 함께 표시됩니다. 파일 입력에는 읽은 시점의 단조 시각을 부여하고, 보드 시간은 프레임의 `tick_us`로 유지합니다. 실물 포트 설정과 연결은 7단계에서, CAN과 결합한 시험 판정은 6단계에서 검증합니다.
+
+`STATUS`에서 확인한 FPGA 오류 비트는 현재 UART 세션에 유지합니다. 이후 `STATUS`에서 비트가 내려가도 같은 세션의 새 회차에 오류를 표시합니다. 보드 리셋이나 명시적 재연결로 새 세션을 열면 다시 관측하며, FPGA가 오류를 계속 보고하면 새 세션에도 기록합니다.
