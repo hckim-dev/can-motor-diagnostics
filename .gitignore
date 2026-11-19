@@ -1,0 +1,25 @@
+# 로컬 빌드와 Python 실행 환경
+build/
+cmake-build-*/
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# CubeIDE 및 Vivado 빌드 출력
+/firmware/**/Debug/
+/firmware/**/Release/
+*.cache/
+*.gen/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.jou
+*.log
+
+# 로컬 환경 설정과 원본 계측 데이터
+.env
+.env.local
+/logs/
+/captures/
