@@ -27,3 +27,11 @@ python3 tests/check_tcp_mock.py
 `tcp_mock.py`는 TCP 연결, 메시지 경계, 응답 전송을 담당합니다. `tcp_mock_control.py`는 heartbeat 만료, 시험 준비 상태, 중복 요청을 처리합니다.
 
 `python3 -X dev -W error tests/check_tcp_control.py -v`로 별도 서버를 임시 포트에 띄워 정상 조작, 만료, 재접속, 잘못된 입력을 검증할 수 있습니다.
+
+CAN 수신 목업은 `python3 backend/tcp_mock.py --can-fixture tests/fixtures/can-rx-timed.jsonl`로 실행합니다. 예제를 서버 시작 시점부터 한 번 공급하며, 유효한 수신이 없으면 TCP 스냅샷의 모터 상태는 `UNKNOWN`, 측정값은 `null`입니다. 예제 공급이 끝난 뒤에도 스냅샷을 보내며 각 필드는 규격에 따라 만료됩니다. 처음부터 다시 보려면 서버를 재시작합니다.
+
+`can_rx/codec.py`는 CAN 프레임을 디코딩하고, `can_rx/samples.py`는 측정 프레임을 결합합니다. `can_rx/state.py`는 HELLO·epoch·만료를 적용해 TCP 상태를 구성하고, 수신 순번·단조 시각·원본 ID를 부여합니다. `can_rx/fixture.py`는 예제 입력만 공급합니다. 새 부팅이나 연결 복구 시 300ms 동안 측정 결합을 보류합니다. 이 시간 이후의 지연 프레임 혼합을 막으려면 실제 어댑터의 큐·지연 조건을 별도로 확인해야 합니다.
+
+조작 노드의 새 부팅 ID를 관측하면 이후 더 큰 모터 epoch를 알리는 `MOTOR_HELLO`와 그 epoch의 유효한 `OP_PERMIT`가 모두 들어올 때까지 허가를 미확인으로 표시합니다.
+
+`python3 -X dev -W error -m unittest discover -s tests -p 'check_can_rx.py' -v`로 디코딩, 상태, TCP 스냅샷을 검증합니다.
