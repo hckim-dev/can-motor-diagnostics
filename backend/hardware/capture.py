@@ -9,6 +9,7 @@ from ..can_rx.codec import CanId
 from ..diagnostics.inputs import Input
 from ..diagnostics.journal import FLUSH_INTERVAL_NS, Journal, record_input
 from ..diagnostics.verdict import Config
+from ..fpga_uart.codec import FrameError
 from ..fpga_uart.session import Issue
 from .socketcan import (
     CAN_ERR_BUSOFF,
@@ -18,7 +19,7 @@ from .socketcan import (
     open_can,
     read_can_observation,
 )
-from .uart import open_uart, read_uart
+from .uart import open_uart, read_uart, uart_error_reason
 
 TIME_UNIT_NS = 1_000_000_000
 
@@ -54,9 +55,12 @@ def receive_inputs(devices, readers, duration_ns):
                         break
                     selector.unregister(key.fileobj)
                     event = "can_disconnect" if source == "can" else "fpga_disconnect"
-                    detail = (
-                        {"reason": can_error_reason(exc)} if source == "can" else None
+                    reason = (
+                        can_error_reason(exc)
+                        if source == "can"
+                        else uart_error_reason(exc)
                     )
+                    detail = {"reason": reason}
                     yield now, "service", event, str(exc), detail
                     continue
                 now = time.monotonic_ns()
@@ -110,7 +114,12 @@ def capture(devices, readers, journal, config, duration_ns):
         receive_inputs(devices, readers, duration_ns), 1
     ):
         record = Input(journal.evidence_session, seq, now, source, payload, detail)
-        received, _ = record_input(journal, engine, record)
+        received, completed = record_input(journal, engine, record)
+        counts.update(
+            "fpga_status_timeouts"
+            for result in completed
+            if "FPGA_STATUS_TIMEOUT" in result["issues"]
+        )
         if error:
             errors.append(error)
         if source == "can":
@@ -122,7 +131,14 @@ def capture(devices, readers, journal, config, duration_ns):
                 counts["can_motor_states"] += 1
         elif source == "fpga":
             for observation in received:
-                if Issue.COUNTER_DISCONTINUITY in observation.issues:
+                issues = observation.issues
+                counts["fpga_crc_errors"] += FrameError.CRC in issues
+                counts["fpga_version_errors"] += FrameError.VERSION in issues
+                counts["fpga_field_errors"] += FrameError.FIELDS in issues
+                counts["fpga_tx_gaps"] += Issue.TX_GAP in issues
+                counts["fpga_run_gaps"] += Issue.RUN_GAP in issues
+                counts["fpga_invalid_observations"] += Issue.FPGA_INVALID in issues
+                if Issue.COUNTER_DISCONTINUITY in issues:
                     counts["fpga_session_discontinuities"] += 1
                     errors.append(
                         "FPGA UART 순번 또는 시각 불연속으로 세션이 격리됐습니다"
@@ -130,7 +146,7 @@ def capture(devices, readers, journal, config, duration_ns):
                 elif (
                     observation.frame is not None
                     and not observation.duplicate
-                    and Issue.SESSION_QUARANTINED not in observation.issues
+                    and Issue.SESSION_QUARANTINED not in issues
                 ):
                     counts["fpga_frames"] += 1
     journal.finish(engine)
@@ -142,6 +158,17 @@ def capture(devices, readers, journal, config, duration_ns):
         missing.append("호환 MOTOR_HELLO에 이어 유효한 MOTOR_STATE를 받지 못했습니다")
     if "fpga" in devices and not counts["fpga_frames"]:
         missing.append("유효한 FPGA UART 프레임을 받지 못했습니다")
+    for name, message in (
+        ("fpga_crc_errors", "FPGA UART CRC 오류"),
+        ("fpga_version_errors", "FPGA UART 지원하지 않는 프레임 버전"),
+        ("fpga_field_errors", "FPGA UART 프레임 필드 오류"),
+        ("fpga_tx_gaps", "FPGA UART 전송 순번 누락"),
+        ("fpga_run_gaps", "FPGA UART 시험 순번 누락"),
+        ("fpga_invalid_observations", "FPGA overflow/invalid 상태 관측"),
+        ("fpga_status_timeouts", "FPGA UART STATUS 만료"),
+    ):
+        if counts[name]:
+            errors.append(f"{message} {counts[name]}건")
     return {
         "ok": not (errors or missing),
         "counts": dict(counts),
@@ -153,13 +180,17 @@ def capture_hardware(output, interface, uart, duration_ns):
     config = Config(functional_only=True)
     devices = {}
     readers = {"can": read_can_observation, "fpga": read_uart}
-    hardware = {"can_interface": interface, "fpga_uart": str(uart) if uart else None}
+    hardware = {
+        "can_interface": interface,
+        "fpga_uart": str(uart) if uart else None,
+        "fpga_status_watchdog": uart is not None,
+    }
     with ExitStack() as stack:
         if interface:
             devices["can"] = stack.enter_context(
                 open_can(interface, count_overflow=True)
             )
         if uart:
-            devices["fpga"] = stack.enter_context(open_uart(uart))
+            devices["fpga"] = stack.enter_context(open_uart(uart, discard_pending=True))
         with Journal(output, config, hardware=hardware) as journal:
             return capture(devices, readers, journal, config, duration_ns)

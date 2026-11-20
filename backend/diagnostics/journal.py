@@ -194,8 +194,12 @@ class Journal:
             raise ValueError("원본 입력의 해시 불일치")
 
     def new_engine(self, config):
+        hardware = self.manifest.get("hardware", {})
         engine = DiagnosticEngine(
-            self.evidence_session, config, on_sample=self.measurements.completed.append
+            self.evidence_session,
+            config,
+            on_sample=self.measurements.completed.append,
+            fpga_status_watchdog=hardware.get("fpga_status_watchdog") is True,
         )
         self._needs_finish = True
         return engine

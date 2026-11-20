@@ -12,15 +12,19 @@ SERVICES = {
     "can_rx_overflow",
     "fpga_disconnect",
     "fpga_reconnect",
+    "fpga_retry_failed",
     "stop",
     "reset",
     "recording_failed",
 }
-CAN_SERVICE_FIELDS = {
+SERVICE_DETAIL_FIELDS = {
     "can_disconnect": {"reason"},
     "can_reconnect": {"attempt"},
     "can_retry_failed": {"attempt", "reason"},
     "can_rx_overflow": {"dropped"},
+    "fpga_disconnect": {"reason"},
+    "fpga_reconnect": {"attempt"},
+    "fpga_retry_failed": {"attempt", "reason"},
 }
 
 
@@ -68,7 +72,7 @@ class Input:
             if (
                 source != "service"
                 or not isinstance(detail, dict)
-                or detail.keys() != CAN_SERVICE_FIELDS.get(payload)
+                or detail.keys() != SERVICE_DETAIL_FIELDS.get(payload)
                 or ("reason" in detail and not isinstance(detail["reason"], str))
                 or any(
                     type(value) is not int or value <= 0
@@ -76,13 +80,14 @@ class Input:
                     if key in ("attempt", "dropped")
                 )
             ):
-                raise ValueError("CAN 서비스 세부 정보 형식 오류")
+                raise ValueError("서비스 세부 정보 형식 오류")
         elif source == "service" and payload in (
             "can_reconnect",
             "can_retry_failed",
             "can_rx_overflow",
+            "fpga_retry_failed",
         ):
-            raise ValueError("CAN 서비스 세부 정보 누락")
+            raise ValueError("서비스 세부 정보 누락")
         record = cls(session, seq, int(raw_time), source, payload, detail)
         for name in ("backend_session", "ingest_seq", "record_id"):
             if name in row and row[name] != getattr(record, name):

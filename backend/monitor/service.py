@@ -14,7 +14,7 @@ class Monitor:
         self.journal = journal
         self.engine = journal.new_engine(config)
         self.feed = feed
-        self.observe_can = getattr(feed, "observe_can", None)
+        self.observe_devices = getattr(feed, "observe_devices", None)
         self.fpga_last_ns = None
         self.fpga_degraded = False
         self.events = []
@@ -67,7 +67,11 @@ class Monitor:
             },
             fpga_connected=uart.connected,
             fpga_degraded=self.fpga_degraded or uart.quarantined,
-            fpga_last_ns=self.fpga_last_ns,
+            fpga_last_ns=(
+                self.engine.fpga_status_ns
+                if self.engine.fpga_status_watchdog
+                else self.fpga_last_ns
+            ),
             healthy_recording=self.engine.healthy_recording,
         )
 
@@ -110,8 +114,8 @@ class Monitor:
             # 쓰기 작업이 끝난 뒤에만 호출자가 파일을 닫을 수 있다.
             await task
             raise
-        if self.observe_can is not None:
-            self.observe_can(snapshot)
+        if self.observe_devices is not None:
+            self.observe_devices(snapshot)
         self.stream.publish(snapshot, events)
 
     async def run(self, stop):

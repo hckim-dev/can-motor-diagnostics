@@ -32,7 +32,7 @@ from backend.hardware.socketcan import (
     read_can_observation,
     read_external_frame,
 )
-from backend.monitor.inputs import CAN_STABLE_NS, DeviceFeed
+from backend.monitor.inputs import DEVICE_STABLE_NS, DeviceFeed
 from backend.monitor.service import Monitor
 
 
@@ -404,48 +404,55 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(sock.fileno() == -1 for sock in sockets))
 
     async def test_fpga_input_continues_while_can_retry_is_pending(self):
-        opener = Mock(side_effect=OSError(errno.ENODEV, "분리됨"))
-        with (
-            ExitStack() as stack,
-            patch("backend.monitor.inputs.CAN_RETRY_DELAYS", (10.0,)),
+        for error, reason in (
+            (OSError(errno.ENODEV, "분리됨"), "INTERFACE_MISSING"),
+            (ValueError("CAN 인터페이스가 아닙니다"), "INVALID_INTERFACE"),
         ):
-            sender, receiver = map(
-                stack.enter_context, socket.socketpair(type=socket.SOCK_DGRAM)
-            )
-            receiver.setblocking(False)
-            feed = DeviceFeed(
-                {"fpga": receiver},
-                {"fpga": lambda sock: sock.recv(32)},
-                can_open=opener,
-            )
-            records = feed.records()
-            try:
-                self.assertEqual((await anext(records))[0][2], "can_disconnect")
-                sender.send(b"uart-data")
-                ((_, source, raw),) = await asyncio.wait_for(anext(records), 1)
-                self.assertEqual((source, raw), ("fpga", b"uart-data"))
-                opener.assert_called_once_with()
-            finally:
-                await records.aclose()
+            with (
+                self.subTest(reason=reason),
+                ExitStack() as stack,
+                patch("backend.monitor.inputs.CAN_RETRY_DELAYS", (10.0,)),
+            ):
+                opener = Mock(side_effect=error)
+                sender, receiver = map(
+                    stack.enter_context, socket.socketpair(type=socket.SOCK_DGRAM)
+                )
+                receiver.setblocking(False)
+                feed = DeviceFeed(
+                    {"fpga": receiver},
+                    {"fpga": lambda sock: sock.recv(32)},
+                    can_open=opener,
+                )
+                records = feed.records()
+                try:
+                    (event,) = await anext(records)
+                    self.assertEqual(event[2:], ("can_disconnect", {"reason": reason}))
+                    sender.send(b"uart-data")
+                    ((_, source, raw),) = await asyncio.wait_for(anext(records), 1)
+                    self.assertEqual((source, raw), ("fpga", b"uart-data"))
+                    opener.assert_called_once_with()
+                finally:
+                    await records.aclose()
 
     def test_retry_budget_resets_after_continuous_fresh_state(self):
-        feed = DeviceFeed({}, {})
-        feed.can_attempts = 2
+        feed = DeviceFeed({}, {}, can_open=Mock())
+        retry = feed.retry_states["can"]
+        retry.attempts = 2
         can = Mock()
 
         def status(now, link):
             can.last_state_ns = now
             can.at.return_value = {"motor": {"link": link}}
-            feed.observe_can(SimpleNamespace(logical_ns=now, can=can))
+            feed.observe_devices(SimpleNamespace(logical_ns=now, can=can))
 
         status(0, "fresh")
-        status(CAN_STABLE_NS, "fresh")
-        self.assertEqual(feed.can_attempts, 2)
-        status(CAN_STABLE_NS + 1, "stale")
-        started = CAN_STABLE_NS + 2
+        status(DEVICE_STABLE_NS, "fresh")
+        self.assertEqual(retry.attempts, 2)
+        status(DEVICE_STABLE_NS + 1, "stale")
+        started = DEVICE_STABLE_NS + 2
         step = 100_000_000
-        for now in range(started, started + CAN_STABLE_NS, step):
+        for now in range(started, started + DEVICE_STABLE_NS, step):
             status(now, "fresh")
-        self.assertEqual(feed.can_attempts, 2)
-        status(started + CAN_STABLE_NS, "fresh")
-        self.assertEqual(feed.can_attempts, 0)
+        self.assertEqual(retry.attempts, 2)
+        status(started + DEVICE_STABLE_NS, "fresh")
+        self.assertEqual(retry.attempts, 0)

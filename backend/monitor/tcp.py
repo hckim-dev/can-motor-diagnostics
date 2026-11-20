@@ -6,10 +6,10 @@ from collections import deque
 from dataclasses import dataclass
 
 from ..can_rx.state import STATE_LIFETIME, CanView
+from ..fpga_uart.session import STATUS_LIFETIME_NS
 from ..tcp_stream import TcpStream
 
 EVENT_LIMIT = 32
-FPGA_STATUS_LIFETIME_NS = 300_000_000
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ class MonitorView:
                 fpga = "DEGRADED"
             elif self.fpga_last_ns is not None:
                 age_ns = now_ns - self.fpga_last_ns
-                fpga = "OK" if age_ns < FPGA_STATUS_LIFETIME_NS else "DEGRADED"
+                fpga = "OK" if age_ns < STATUS_LIFETIME_NS else "DEGRADED"
 
         return {
             **view,

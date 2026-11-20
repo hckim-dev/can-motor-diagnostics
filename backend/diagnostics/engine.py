@@ -6,7 +6,7 @@ from ..can_rx.codec import SUPPLY_PRESENT, SUPPLY_VALID, CanId, Mode, State
 from ..can_rx.samples import SampleAssembler
 from ..can_rx.state import FAULT_LIFETIME, NC2_OPEN, STATE_LIFETIME, CanReceiver, fresh
 from ..fpga_uart.codec import DIAG_HIGH, READY_HIGH, TIMING_VALID, EventType, Phase
-from ..fpga_uart.session import RunStatus, UartReceiver
+from ..fpga_uart.session import STATUS_LIFETIME_NS, Issue, RunStatus, UartReceiver
 from .inputs import Input
 from .verdict import (
     FEEDBACK_MISSING,
@@ -21,7 +21,14 @@ CONTROL_FRAMES = {CanId.MOTOR_HELLO, CanId.MOTOR_STATE, CanId.MOTOR_FAULT}
 
 
 class DiagnosticEngine:
-    def __init__(self, backend_session: str, config, *, on_sample=None):
+    def __init__(
+        self,
+        backend_session: str,
+        config,
+        *,
+        on_sample=None,
+        fpga_status_watchdog=False,
+    ):
         self.backend_session = backend_session
         self.config = config
         self._namespace = UUID(backend_session)
@@ -34,6 +41,8 @@ class DiagnosticEngine:
         )
         self._uart_generation = 0
         self.uart = UartReceiver(self._next_uart_session)
+        self.fpga_status_watchdog = fpga_status_watchdog
+        self.fpga_status_ns = None
         self.idle_evidence: tuple[str, ...] = ()
         self.healthy_recording = True
         self.trial: Trial | None = None
@@ -61,6 +70,17 @@ class DiagnosticEngine:
         ):
             trial.add_issue("CAN_STALE")
 
+    def _check_fpga_interval(self, now_ns):
+        trial = self.trial
+        if not self.fpga_status_watchdog or trial is None or trial.end_ns is not None:
+            return
+        last = trial.start_ns if self.fpga_status_ns is None else self.fpga_status_ns
+        deadline = max(trial.start_ns, last + STATUS_LIFETIME_NS)
+        if now_ns >= deadline:
+            trial.add_evidence(*self.uart.pending_record_ids)
+            trial.add_issue("FPGA_STATUS_TIMEOUT")
+            self._close(deadline)
+
     def ingest(self, record: Input):
         if (
             record.backend_session != self.backend_session
@@ -76,6 +96,7 @@ class DiagnosticEngine:
         overflow = record.source == "service" and record.payload == "can_rx_overflow"
         if not overflow and self._deadline() is not None and now > self._deadline():
             self._close(self._deadline())
+        self._check_fpga_interval(now)
         if self.trial and self.trial.end_ns is None:
             if expired := self.uart.advance(now):
                 self._interrupt(expired, record.record_id)
@@ -201,6 +222,11 @@ class DiagnosticEngine:
             trial.add_issue("RECORDING_FAILED")
         if not baseline or not self.idle_evidence:
             trial.add_issue("MID_RUN_ATTACH")
+        if self.fpga_status_watchdog and (
+            self.fpga_status_ns is None
+            or self.now_ns - self.fpga_status_ns >= STATUS_LIFETIME_NS
+        ):
+            trial.add_issue("FPGA_STATUS_UNAVAILABLE")
         if (
             baseline
             and self.config.gpio_verified
@@ -237,9 +263,16 @@ class DiagnosticEngine:
         if observation.duplicate:
             return
         record_ids = observation.record_ids or (record_id,)
+        frame, run = observation.frame, observation.run
+        if (
+            Issue.COUNTER_DISCONTINUITY in observation.issues
+            or Issue.SESSION_QUARANTINED in observation.issues
+        ):
+            self.fpga_status_ns = None
+        elif frame is not None and frame.kind == EventType.STATUS:
+            self.fpga_status_ns = self.now_ns
         if observation.interrupted_run is not None:
             self._interrupt(observation.interrupted_run, *record_ids)
-        frame, run = observation.frame, observation.run
         if (
             self.trial is None
             and run is None
@@ -337,13 +370,15 @@ class DiagnosticEngine:
         if event == "recording_failed":
             self.healthy_recording = False
             self.can.samples.reset()
-        if event in ("can_reconnect", "can_retry_failed"):
+        if event in ("can_reconnect", "can_retry_failed", "fpga_retry_failed"):
             return
         if event == "can_rx_overflow":
             self.can_socket_drops += record.detail["dropped"]
         if event in ("can_disconnect", "can_rx_overflow"):
             self.can.disconnect(self.now_ns)
         if event in ("fpga_disconnect", "fpga_reconnect"):
+            if trial is not None and record.detail is not None:
+                trial.add_evidence(*self.uart.pending_record_ids)
             operation = (
                 self.uart.disconnect
                 if event == "fpga_disconnect"
@@ -351,6 +386,7 @@ class DiagnosticEngine:
             )
             operation(self.now_ns)
             self.idle_evidence = ()
+            self.fpga_status_ns = None
         if trial is None:
             return
         trial.add_evidence(record.record_id)

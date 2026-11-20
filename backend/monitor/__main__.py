@@ -49,12 +49,10 @@ def main():
             if args.fixture:
                 file = stack.enter_context(args.fixture.open(encoding="utf-8"))
             else:
-                devices = {}
-                if args.uart:
-                    devices["fpga"] = stack.enter_context(open_uart(args.uart))
                 hardware = {
                     "can_interface": args.can,
                     "fpga_uart": str(args.uart) if args.uart else None,
+                    "fpga_status_watchdog": bool(args.uart),
                 }
             journal = stack.enter_context(
                 Journal(args.output, config, hardware=hardware)
@@ -63,11 +61,16 @@ def main():
                 FixtureFeed(file, journal.evidence_session)
                 if args.fixture
                 else DeviceFeed(
-                    devices,
+                    {},
                     {"can": read_can_observation, "fpga": read_uart},
                     can_open=(
                         partial(open_can, args.can, count_overflow=True)
                         if args.can
+                        else None
+                    ),
+                    fpga_open=(
+                        partial(open_uart, args.uart, discard_pending=True)
+                        if args.uart
                         else None
                     ),
                 )

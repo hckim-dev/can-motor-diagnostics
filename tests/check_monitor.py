@@ -153,7 +153,11 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
             rows = scenario_rows()
             telemetry = sample(50, 1, motor_state=State.TEST_ARMED, mode=Mode.TEST)
             rows = [*rows[:5], *telemetry, *rows[5:]]
-            rows += [service(2900, "can_disconnect"), service(3000, "fpga_disconnect")]
+            disconnect_detail = {"reason": "IO_ERROR"}
+            rows += [
+                service(2900, "can_disconnect"),
+                {**service(3000, "fpga_disconnect"), "detail": disconnect_detail},
+            ]
             save_fixture(fixture, rows)
             command = [
                 sys.executable,
@@ -265,6 +269,12 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(process.returncode, 0, errors.decode())
             (saved,) = rows_in(output / "events.jsonl")
             self.assertEqual(saved["event_id"], event["data"]["event_id"])
+            (disconnect,) = (
+                row
+                for row in rows_in(output / "inputs.jsonl")
+                if row.get("event") == "fpga_disconnect"
+            )
+            self.assertEqual(disconnect.get("detail"), disconnect_detail)
             self.assertEqual(
                 rows_in(output / "manifest.json")[0]["backend_session"],
                 hello_msg["data"]["backend_session"],
