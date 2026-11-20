@@ -150,6 +150,28 @@ python3 -m backend.hardware can-tx-probe --can "$CAN_IFACE" \
 
 이 명령은 CAN 2.1 `OP_HELLO` 한 프레임을 제출합니다. `--motor-power-off`는 작업자의 확인입니다. `socket_echo`는 로컬 소켓의 확인이며, 실물 송신은 별도 CAN 수신 노드나 분석기에서 `0x701`과 출력된 payload를 대조해 확인합니다. 부팅 ID 파일은 동일 조작 노드의 재실행에서 재사용합니다. [Linux SocketCAN](https://docs.kernel.org/networking/can.html)
 
+### 전원 차단 CAN 조작 점검
+
+송신 프로브가 종료된 뒤 같은 부팅 ID 파일을 사용해 로컬 TCP 조작 점검을 실행합니다. 프로브와 조작 서버는 실행 중 부팅 ID 파일의 잠금을 유지하며, 같은 파일을 사용하는 두 번째 실행은 시작 오류를 반환합니다.
+
+```sh
+python3 -m backend.hardware can-control --can "$CAN_IFACE" \
+  --boot-id-file .local/jetson-operator-boot-id --motor-power-off
+```
+
+서버는 기본 `127.0.0.1:5000`에서 연결을 받습니다. TCP 클라이언트는 `hello`에서 받은 새 `stream_id`로 heartbeat를 보내고, 새 `request_id`를 사용해 `ARM_TEST`, `STOP`, `RESET` 요청을 보냅니다. MCU가 TEST 모드와 모터 공급 차단을 보고할 때만 준비 허가를 보냅니다. 이 점검에서 `START_REAL`은 `POWER_OFF_TEST_ONLY`로 거부합니다.
+
+SocketCAN은 `OP_HELLO`(`0x701`), 허가·출력 억제 `OP_PERMIT`(`0x080`), `COMMAND`(`0x100`)를 비차단으로 제출합니다. 정상 허가 주기는 50ms입니다. 제출 대기 50ms가 만료되면 대기 명령을 폐기하고, 제출 후 300ms 동안 MCU 결과가 없으면 `UNKNOWN_OUTCOME`으로 종료합니다. CAN 재연결이나 MCU 부팅 번호 변경 후에는 `OP_HELLO`를 다시 보내고, 출력 억제 이후의 새 epoch 정지 상태와 새 heartbeat를 확인합니다. 새 명령 요청이 있어야 시험 준비를 다시 시도합니다. 종료 시 가능한 경우 출력 억제 프레임을 한 번 제출합니다.
+
+수신 큐에 프레임이 남아 있어도 출력 억제를 먼저 제출할 수 있습니다. 이때 처음 보낸 억제는 복구 판정의 기준으로 삼지 않으며, 큐를 비운 뒤 다시 제출한 억제에 대해 새 정지 상태를 확인합니다.
+
+수신 큐 드롭이나 SocketCAN 패킷 형식 오류로 연결을 끊을 때는 소켓을 닫기 전에 출력 억제 제출을 한 번 시도합니다. 재연결 후에는 새 억제와 정지 상태를 확인합니다.
+
+조작 서버의 TCP 상태에는 자기 소켓에서 에코된 `OP_HELLO`와 `OP_PERMIT`를 사용합니다. 수신 전용 점검은 버스에서 들어온 조작 프레임을 계속 관측합니다.
+
+실물 검증에서는 CAN 분석기로 허가 주기와 STOP·TCP 단절 직후 억제 프레임이 도달한 시점을 확인합니다. MCU의 `COMMAND_RESULT`(`0x110`)와 `MOTOR_STATE`를 각각 대조하고, CAN 단절·복구 및 프로세스 재시작 이후 이전 명령이 실행되지 않는지 확인합니다. 소켓 제출과 로컬 에코는 Jetson에서 확인할 수 있습니다. 제출된 프레임의 실제 버스 도달 시점과 드라이버·어댑터 큐의 잔류 동작은 실물 계측이 필요합니다.
+
 ```sh
 python3 -X dev -W error -m unittest discover -s tests -p 'check_hardware.py' -v
+python3 -X dev -W error -m unittest discover -s tests -p 'check_live_can_control.py' -v
 ```

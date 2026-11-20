@@ -1,12 +1,15 @@
-"""실물 장치의 수신 기록과 별도 CAN 송신 제출을 점검한다."""
+"""실물 수신을 기록하고 전원 차단 상태에서 CAN 송신을 점검한다."""
 
 import argparse
+import asyncio
 import math
 import termios
 from pathlib import Path
 
 from ..diagnostics.journal import json_line
+from ..tcp_stream import PORT
 from .capture import TIME_UNIT_NS, capture_hardware
+from .live_control import serve_live_control
 from .tx_probe import send_hello_probe
 
 
@@ -33,9 +36,32 @@ def main():
         "--motor-power-off", action="store_true", help="모터 6V 물리 차단 확인"
     )
     probe.add_argument("--timeout", type=seconds, default=1.0)
+
+    control = commands.add_parser("can-control", help="전원 차단 CAN 조작 점검")
+    control.add_argument("--can", required=True)
+    control.add_argument("--boot-id-file", type=Path, required=True)
+    control.add_argument(
+        "--motor-power-off",
+        action="store_true",
+        required=True,
+        help="모터 6V 물리 차단 확인",
+    )
+    control.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()
 
     try:
+        if args.command == "can-control":
+            if not 0 <= args.port <= 65535:
+                parser.error("--port는 0부터 65535까지 지정할 수 있습니다")
+            asyncio.run(
+                serve_live_control(
+                    args.can,
+                    args.boot_id_file,
+                    args.port,
+                    motor_power_off=args.motor_power_off,
+                )
+            )
+            return 0
         if args.command == "capture":
             if not (args.can or args.uart):
                 parser.error("--can 또는 --uart를 하나 이상 지정해야 합니다")

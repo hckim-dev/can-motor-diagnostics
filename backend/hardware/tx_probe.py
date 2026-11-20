@@ -3,10 +3,11 @@
 import math
 import socket
 import time
+from contextlib import ExitStack
 
-from ..can_control.boot_id import next_boot_id
+from ..can_control.boot_id import boot_id_session
 from ..can_control.wire import encode_operator_hello
-from .socketcan import CAN_FRAME, open_can
+from .socketcan import CAN_FRAME, open_can, pack_frame
 
 
 def send_hello_probe(interface, boot_file, timeout, *, motor_power_off=False):
@@ -15,13 +16,14 @@ def send_hello_probe(interface, boot_file, timeout, *, motor_power_off=False):
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("CAN 송신 점검 시간은 유한한 양수여야 합니다")
 
-    with open_can(interface) as sock:
+    with ExitStack() as stack:
+        sock = stack.enter_context(open_can(interface))
         # 소켓이 처리할 수 없는 시간은 부팅 ID 발급과 송신 전에 거부한다.
         sock.settimeout(timeout)
         sock.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_RECV_OWN_MSGS, 1)
-        boot_id = next_boot_id(boot_file)
+        boot_id = stack.enter_context(boot_id_session(boot_file))
         frame = encode_operator_hello(boot_id)
-        packet = CAN_FRAME.pack(frame.can_id, frame.dlc, 0, frame.data)
+        packet = pack_frame(frame)
         deadline = time.monotonic() + timeout
         if sock.send(packet) != len(packet):
             raise OSError("OP_HELLO를 온전히 제출하지 못했습니다")

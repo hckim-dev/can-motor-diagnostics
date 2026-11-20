@@ -35,6 +35,7 @@ from .wire import (
 HEARTBEAT_TIMEOUT_NS = 300 * NS_PER_MS
 HELLO_PERIOD_NS = 500 * NS_PER_MS
 PERMIT_PERIOD_NS = 50 * NS_PER_MS
+POLL_INTERVAL = 0.01
 SEND_TIMEOUT_NS = 50 * NS_PER_MS
 RESULT_TIMEOUT_NS = 300 * NS_PER_MS
 ACTIVE_STATES = (State.RUNNING, State.TEST_ARMED, State.TEST_ACTIVE)
@@ -89,13 +90,22 @@ class InhibitRequest:
 
 
 class CanController:
-    def __init__(self, receiver, try_send, boot_id, rpm_max=MAX_TARGET_RPM):
+    def __init__(
+        self,
+        receiver,
+        try_send,
+        boot_id,
+        rpm_max=MAX_TARGET_RPM,
+        *,
+        power_off_test=False,
+    ):
         if not 1 <= rpm_max <= MAX_TARGET_RPM:
-            raise ValueError("목업 최대 RPM 범위 오류")
+            raise ValueError("최대 RPM 범위 오류")
         self.receiver = receiver
         self.try_send = try_send
         self.operator_hello = encode_operator_hello(boot_id)
         self.rpm_max = rpm_max
+        self.power_off_test = power_off_test
         self.next_hello_ns = 0
         self.operator_announced = False
         self.can_connected = True
@@ -145,10 +155,17 @@ class CanController:
     def _apply_motor_observation(self, now_ns):
         epoch = self.receiver.highest_epoch
         if epoch != self.epoch and self.receiver.motor_known(now_ns):
+            boot_changed = self.epoch != 0 and self.epoch >> 16 != epoch >> 16
             self.epoch = epoch
             self.cmd_seq = self.alive_seq = 0
             self.permit_sent_ns = None
             self.next_permit_ns = now_ns
+            if self.power_off_test and boot_changed:
+                self.heartbeat_until_ns = None
+                self.operator_announced = False
+                self.next_hello_ns = now_ns
+                self.start_inhibit("CANCELLED_BY_SESSION", renew=True)
+
             # 송신한 STOP 결과는 이전 epoch의 키로 도착할 수 있다.
             pending = self.pending
             if pending and (pending.opcode != Opcode.STOP or pending.sent_ns is None):
@@ -199,6 +216,14 @@ class CanController:
             and state is not None
             and state.mode in (Mode.REAL, Mode.TEST)
             and not state.flags & NC2_OPEN
+            and (
+                not self.power_off_test
+                or (
+                    state.mode == Mode.TEST
+                    and state.flags & SUPPLY_VALID
+                    and not state.flags & SUPPLY_PRESENT
+                )
+            )
         )
 
     def start_inhibit(self, reason, *, renew=False):
@@ -222,7 +247,7 @@ class CanController:
             self.inhibit = None
             self.next_permit_ns = 0
 
-    def send_permit(self, now_ns):
+    def send_permit(self, now_ns, *, receive_queue_drained=True):
         if not self.epoch or now_ns < self.next_permit_ns:
             return
 
@@ -235,20 +260,25 @@ class CanController:
                 if state is None or state.state not in ACTIVE_STATES:
                     return
             frame = encode_permit(self.epoch, self.alive_seq, inhibit=True)
-        elif self.operator_announced and self.can_grant(self.current_state(now_ns)):
+        elif (
+            receive_queue_drained
+            and self.operator_announced
+            and self.can_grant(self.current_state(now_ns))
+        ):
             frame = encode_permit(self.epoch, self.alive_seq, ready=True)
         else:
             return
 
         sent = self.try_send(frame)
-        # 실패한 억제 프레임은 다음 버스 주기에 다시 시도한다.
-        if sent or self.inhibit is None:
+        # 확인 기준을 남기지 못한 억제는 다음 버스 주기에 다시 시도한다.
+        if (sent and receive_queue_drained) or self.inhibit is None:
             self.next_permit_ns = now_ns + PERMIT_PERIOD_NS
         if not sent:
             return
         self.alive_seq = (self.alive_seq + 1) & SEQUENCE_MASK
         if self.inhibit is not None:
-            if (
+            # 수신 대기열이 남으면 그 안의 STATE로 억제를 확인할 수 없다.
+            if receive_queue_drained and (
                 self.inhibit.sent_after_record is None
                 or self.epoch > self.inhibit.epoch
             ):
@@ -295,6 +325,8 @@ class CanController:
         self.advance_time(now_ns)
         if not valid_argument(opcode, argument):
             return Outcome(request_id, "REJECTED", "BAD_ARGUMENT")
+        if self.power_off_test and opcode == Opcode.START_REAL:
+            return Outcome(request_id, "REJECTED", "POWER_OFF_TEST_ONLY")
         if opcode == Opcode.STOP:
             self.start_inhibit("CANCELLED_BY_STOP", renew=True)
             if not self.receiver.motor_known(now_ns) or self.cmd_seq >= MAX_CMD_SEQ:

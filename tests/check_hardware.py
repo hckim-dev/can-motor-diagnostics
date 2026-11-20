@@ -79,14 +79,16 @@ class SocketCanTest(unittest.TestCase):
             (raw, [], socket.MSG_CONFIRM, ("can0",)),
         ]
         with (
+            tempfile.TemporaryDirectory() as directory,
             patch("backend.hardware.tx_probe.open_can", return_value=fake) as open_can,
-            patch("backend.hardware.tx_probe.next_boot_id", return_value=10) as boot,
         ):
+            boot = Path(directory) / "boot-id"
+            boot.write_text("9\n", encoding="ascii")
             with self.assertRaisesRegex(ValueError, "모터 6V 물리 차단"):
-                send_hello_probe("can0", Path("unused"), 0.5)
+                send_hello_probe("can0", boot, 0.5)
             open_can.assert_not_called()
-            boot.assert_not_called()
-            result = send_hello_probe("can0", Path("unused"), 0.5, motor_power_off=True)
+            self.assertEqual(boot.read_text(encoding="ascii"), "9\n")
+            result = send_hello_probe("can0", boot, 0.5, motor_power_off=True)
         fake.send.assert_called_once_with(raw)
         self.assertEqual(fake.recvmsg.call_count, 2)
         self.assertTrue(result["socket_echo"])
@@ -94,7 +96,7 @@ class SocketCanTest(unittest.TestCase):
     def test_unusable_probe_timeout_does_not_allocate_boot_id_or_submit(self):
         with (
             patch("backend.hardware.tx_probe.open_can") as open_can,
-            patch("backend.hardware.tx_probe.next_boot_id") as next_boot_id,
+            patch("backend.hardware.tx_probe.boot_id_session") as boot_id_session,
         ):
             for timeout in (0.0, float("nan"), float("inf")):
                 with self.subTest(timeout=timeout), self.assertRaises(ValueError):
@@ -108,7 +110,7 @@ class SocketCanTest(unittest.TestCase):
             with self.assertRaisesRegex(OverflowError, "소켓 시간 범위 초과"):
                 send_hello_probe("can0", Path("unused"), 1e100, motor_power_off=True)
 
-            next_boot_id.assert_not_called()
+            boot_id_session.assert_not_called()
             sock.send.assert_not_called()
 
 

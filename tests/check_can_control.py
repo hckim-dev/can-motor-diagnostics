@@ -20,6 +20,7 @@ from backend.can_control.mock_motor import (
     MemoryCan,
     MockMotor,
 )
+from backend.can_control.tcp import CanControl
 from backend.can_control.wire import (
     MAX_BOOT_ID,
     MAX_CMD_SEQ,
@@ -31,7 +32,7 @@ from backend.can_control.wire import (
 from backend.can_rx.codec import CanId, Frame, Mode, State, decode_frame
 from backend.can_rx.samples import NS_PER_MS
 from backend.can_rx.state import STOP_REQUESTED, CanReceiver
-from backend.tcp_can_mock import CanControl, TcpCanMock
+from backend.tcp_can_mock import TcpCanMock
 
 FIXTURES = Path(__file__).with_name("fixtures")
 TEST_SUPPLY_OFF = 0x04

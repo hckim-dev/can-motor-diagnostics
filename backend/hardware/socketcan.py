@@ -1,4 +1,4 @@
-"""Linux SocketCAN에서 Classical CAN 프레임을 읽는다."""
+"""Linux SocketCAN의 Classical CAN 프레임을 변환하고 소켓을 연다."""
 
 import errno
 import socket
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from struct import Struct
 
-from ..can_rx.codec import Frame
+from ..can_rx.codec import CanId, Frame
 
 CAN_FRAME = Struct("=IB2xB8s")
 CAN_EFF_FLAG = 1 << 31
@@ -67,7 +67,20 @@ def unpack_frame(raw: bytes) -> Frame:
     return Frame(identifier & mask, payload, dlc, extended, remote, error)
 
 
-def open_can(interface: str, *, count_overflow=False):
+def pack_frame(frame: Frame) -> bytes:
+    if (
+        not 0 <= frame.can_id <= CAN_SFF_MASK
+        or frame.extended
+        or frame.rtr
+        or frame.error
+        or frame.dlc != len(frame.data)
+        or frame.dlc > 8
+    ):
+        raise ValueError("표준 Classical CAN 데이터 프레임만 송신합니다")
+    return CAN_FRAME.pack(frame.can_id, frame.dlc, 0, frame.data)
+
+
+def open_can(interface: str, *, count_overflow=False, receive_own=False):
     try:
         socket.if_nametoindex(interface)
     except OSError as exc:
@@ -86,6 +99,8 @@ def open_can(interface: str, *, count_overflow=False):
         sock.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_ERR_FILTER, CAN_ERR_BUSOFF)
         if count_overflow:
             sock.setsockopt(socket.SOL_SOCKET, SO_RXQ_OVFL, 1)
+        if receive_own:
+            sock.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_RECV_OWN_MSGS, 1)
         sock.bind((interface,))
         sock.setblocking(False)
     except BaseException:
@@ -107,7 +122,7 @@ def external_frame(raw, flags):
     return unpack_frame(raw)
 
 
-def read_can_observation(sock):
+def read_can_observation(sock, *, own_operator=False):
     raw, control, flags, _ = sock.recvmsg(
         CAN_FRAME.size, socket.CMSG_SPACE(DROP_COUNT.size)
     )
@@ -121,7 +136,14 @@ def read_can_observation(sock):
             (dropped,) = DROP_COUNT.unpack(data)
             break
     try:
+        own_echo = own_operator and bool(flags & socket.MSG_CONFIRM)
+        if own_echo:
+            flags &= ~socket.MSG_DONTROUTE
         frame = external_frame(raw, flags)
+        if own_operator and frame is not None:
+            operator_frame = frame.can_id in (CanId.OP_HELLO, CanId.OP_PERMIT)
+            if operator_frame != own_echo:
+                frame = None
     except ValueError as exc:
         # 함께 도착한 드롭 카운터는 프레임 오류와 별도로 보존한다.
         return CanRead(frame=None, dropped_total=dropped, error=exc)
