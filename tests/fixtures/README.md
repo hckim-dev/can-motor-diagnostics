@@ -9,5 +9,6 @@
 | [tcp-qt-to-backend.jsonl](tcp-qt-to-backend.jsonl) | Qt가 보내는 heartbeat와 시험 준비 요청. 요청 인자는 0입니다. |
 | [tcp-backend-to-qt.jsonl](tcp-backend-to-qt.jsonl) | backend가 보내는 목업 hello, 초기 `STOPPED` 스냅샷, 시험 준비 결과, `TEST_ARMED` 스냅샷. 두 TCP 파일의 연결과 요청 식별자가 대응하고, 결과의 epoch·cmd_seq는 CAN 예제와 일치합니다. |
 | [fpga-uart-1.0.hex](fpga-uart-1.0.hex) | v1.5 C8의 22바이트 INJECT 벡터. 시나리오 2, tick 1,000,000µs, CRC 0xB09E를 기대합니다. |
+| [diagnostic-no-edge.jsonl](diagnostic-no-edge.jsonl) | CAN·UART·서비스 입력을 단조 시각 순서로 담은 합성 NO_EDGE 예제. GPIO 검증 전제를 적용하면 200,000µs 응답과 `PASS / EXPECTED_FAULT_CONFIRMED`를 기대합니다. |
 
 TCP 파일은 LF로 구분한 UTF-8 JSON 객체입니다. UART 파일은 디코더 입력 전에 hex를 바이트로 변환합니다. 예제는 필드와 경계를 검증하기 위한 입력이며 전체 운전·시험의 계측 기록은 아닙니다.

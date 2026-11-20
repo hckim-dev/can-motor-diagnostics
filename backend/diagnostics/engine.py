@@ -1,0 +1,387 @@
+"""같은 입력 순서에서 CAN과 UART 증거를 시험 회차에 연결한다."""
+
+from uuid import UUID, uuid5
+
+from ..can_rx.codec import SUPPLY_PRESENT, SUPPLY_VALID, CanId, Mode, State
+from ..can_rx.state import FAULT_LIFETIME, NC2_OPEN, STATE_LIFETIME, CanReceiver, fresh
+from ..fpga_uart.codec import DIAG_HIGH, READY_HIGH, TIMING_VALID, EventType, Phase
+from ..fpga_uart.session import RunStatus, UartReceiver
+from .inputs import Input
+from .verdict import (
+    FEEDBACK_MISSING,
+    POST_END_NS,
+    Trial,
+    corroborated,
+    fresh_pair,
+    result_context,
+)
+
+CONTROL_FRAMES = {CanId.MOTOR_HELLO, CanId.MOTOR_STATE, CanId.MOTOR_FAULT}
+
+
+class DiagnosticEngine:
+    def __init__(self, backend_session: str, config):
+        self.backend_session = backend_session
+        self.config = config
+        self.can = CanReceiver(backend_session)
+        self._namespace = UUID(backend_session)
+        self._uart_generation = 0
+        self.uart = UartReceiver(self._next_uart_session)
+        self.idle_evidence: tuple[str, ...] = ()
+        self.healthy_recording = True
+        self.trial: Trial | None = None
+        self.now_ns = 0
+        self.ingest_seq = 0
+        self.results = []
+        self.latest_result = None
+
+    def _next_uart_session(self):
+        self._uart_generation += 1
+        return uuid5(self._namespace, f"fpga:{self._uart_generation}")
+
+    def _check_can_interval(self, now_ns):
+        trial = self.trial
+        if trial is None or trial.end_ns is not None or trial.motor_boot is None:
+            return
+        if not self.can.motor_known(now_ns) or not (
+            fresh(trial.state, now_ns, STATE_LIFETIME)
+            and fresh(trial.fault, now_ns, FAULT_LIFETIME)
+        ):
+            trial.add_issue("CAN_STALE")
+
+    def ingest(self, record: Input):
+        if (
+            record.backend_session != self.backend_session
+            or record.ingest_seq != self.ingest_seq + 1
+            or record.rx_mono_ns < self.now_ns
+        ):
+            raise ValueError("판정 입력의 세션·순번·시각이 연속이어야 한다")
+        self.ingest_seq = record.ingest_seq
+        self.now_ns = now = record.rx_mono_ns
+        self.results = []
+
+        if self._deadline() is not None and now > self._deadline():
+            self._close(self._deadline())
+        if self.trial and self.trial.end_ns is None:
+            if expired := self.uart.advance(now):
+                self._interrupt(expired, record.record_id)
+        self._check_can_interval(now)
+
+        observations = None
+        if record.source == "can":
+            observations = self._receive_can(record)
+        elif record.source == "fpga":
+            observations = self.uart.feed(
+                record.payload, now, record_id=record.record_id
+            )
+            for observation in observations:
+                self._receive_uart(observation, record.record_id)
+        else:
+            self._receive_service(record)
+        return observations, self.results
+
+    def _deadline(self):
+        if self.trial is not None and self.trial.end_ns is not None:
+            return self.trial.end_ns + POST_END_NS
+        return None
+
+    def _receive_can(self, record):
+        received = self.can.ingest(
+            record.payload, self.now_ns, ingest_seq=record.ingest_seq
+        )
+        trial = self.trial
+        if (
+            trial is None
+            or trial.control_after_end
+            or received.frame.can_id not in CONTROL_FRAMES
+        ):
+            return received
+        if received.error:
+            trial.add_evidence(record.record_id)
+            trial.add_issue("CAN_INVALID")
+            return received
+        if not self.can.motor_known(self.now_ns):
+            trial.add_evidence(record.record_id)
+            trial.add_issue("CAN_SESSION_UNCONFIRMED")
+            return received
+        if self.can.highest_epoch >> 16 != trial.motor_boot:
+            trial.add_evidence(record.record_id)
+            trial.add_issue("MOTOR_BOOT_CHANGED")
+            return received
+        if received is self.can.hello:
+            trial.add_evidence(record.record_id)
+        elif received is self.can.state or received is self.can.fault:
+            self._apply_can_evidence(trial, received)
+        return received
+
+    def _apply_can_evidence(self, trial, received):
+        trial.add_evidence(received.record_id)
+        message = received.message
+        if message.mode != Mode.TEST:
+            self._mark_control_change(trial, "MODE_CHANGED")
+            return
+        if received is self.can.state:
+            if message.flags & NC2_OPEN:
+                self._mark_control_change(trial, "ESTOP")
+                if trial.control_after_end:
+                    return
+            trial.state = received
+            if not self._supply_off(message.flags):
+                trial.add_issue("TEST_SUPPLY_UNCONFIRMED")
+            if trial.end_ns is None:
+                trial.active_seen |= message.state == State.TEST_ACTIVE
+                if trial.inject_tick is not None and message.state != State.TEST_ACTIVE:
+                    trial.normal_state_deviation = True
+            elif self.now_ns > trial.end_ns:
+                trial.gap_state = received
+        else:
+            trial.fault = received
+            trial.observed_faults |= message.mask
+            if trial.inject_tick is None:
+                trial.early_fault |= bool(message.mask)
+            if trial.end_ns is not None and self.now_ns > trial.end_ns:
+                trial.gap_fault = received
+        if (
+            trial.scenario_id == 3
+            and trial.end_ns is not None
+            and fresh_pair(trial.gap_state, trial.gap_fault, trial.end_ns)
+        ):
+            # 이후에 고장이 다시 래치돼도 복귀 직후의 해제는 남긴다.
+            trial.gap_fault_cleared |= (
+                trial.gap_state.message.state != State.FAULT
+                or not trial.gap_fault.message.mask & FEEDBACK_MISSING
+            )
+        if (
+            trial.inject_tick is not None
+            and trial.inject_epoch is not None
+            and trial.end_ns is None
+            and corroborated(trial.state, trial.fault)
+        ):
+            trial.expected_fault_seen |= (
+                trial.state.message.state == State.FAULT
+                and trial.state.message.epoch > trial.inject_epoch
+                and trial.fault.message.mask == FEEDBACK_MISSING
+                and fresh(trial.state, self.now_ns, STATE_LIFETIME)
+                and fresh(trial.fault, self.now_ns, FAULT_LIFETIME)
+            )
+
+    @staticmethod
+    def _supply_off(flags):
+        return bool(flags & SUPPLY_VALID and not flags & SUPPLY_PRESENT)
+
+    def _start(self, run, frame, record_ids):
+        baseline = frame.kind == EventType.BASELINE_START
+        trial = Trial(
+            run.run_id,
+            run.scenario,
+            run.first_rx_ns,
+            frame.tick_us if baseline else None,
+            None,
+        )
+        self.trial = trial
+        if not self.healthy_recording:
+            trial.add_issue("RECORDING_FAILED")
+        if not baseline or not self.idle_evidence:
+            trial.add_issue("MID_RUN_ATTACH")
+        if (
+            baseline
+            and self.config.gpio_verified
+            and not self.config.functional_only
+            and not frame.flags & READY_HIGH
+        ):
+            trial.add_issue("FPGA_READY_NOT_OBSERVED")
+        trial.add_evidence(*self.idle_evidence, *record_ids)
+        self.idle_evidence = ()
+        now = self.now_ns
+        if not self.can.motor_known(now) or not (
+            fresh(self.can.state, now, STATE_LIFETIME)
+            and fresh(self.can.fault, now, FAULT_LIFETIME)
+        ):
+            trial.add_issue("CAN_BASELINE_UNAVAILABLE")
+            return
+        trial.motor_boot = self.can.highest_epoch >> 16
+        trial.state = self.can.state
+        trial.fault = self.can.fault
+        trial.add_evidence(
+            self.can.hello.record_id, trial.state.record_id, trial.fault.record_id
+        )
+        state = trial.state.message
+        if (
+            not corroborated(trial.state, trial.fault)
+            or state.state != State.TEST_ARMED
+            or trial.fault.message.mask
+            or state.flags & NC2_OPEN
+            or not self._supply_off(state.flags)
+        ):
+            trial.add_issue("TEST_PRECONDITION_FAILED")
+
+    def _receive_uart(self, observation, record_id):
+        if observation.duplicate:
+            return
+        record_ids = observation.record_ids or (record_id,)
+        if observation.interrupted_run is not None:
+            self._interrupt(observation.interrupted_run, *record_ids)
+        frame, run = observation.frame, observation.run
+        if (
+            self.trial is None
+            and run is None
+            and frame is not None
+            and frame.kind == EventType.STATUS
+            and frame.phase == Phase.COMPLETED
+            and frame.run_seq
+            and frame.scenario
+            and not observation.issues
+        ):
+            self._record_mid_run_attach(observation, record_ids)
+            return
+        if frame and frame.kind == EventType.STATUS and frame.phase == Phase.IDLE:
+            if (
+                frame.scenario == 0
+                and not observation.issues
+                and (run is None or run.status != RunStatus.OPEN)
+            ):
+                self.idle_evidence = record_ids
+        if (
+            run is not None
+            and frame is not None
+            and (self.trial is None or self.trial.run_id != run.run_id)
+        ):
+            if self.latest_result and self.latest_result["run_id"] == run.run_id:
+                return
+            if self.trial is not None:
+                self.trial.add_issue("OVERLAPPING_RUN")
+                self._close(self.now_ns)
+            self._start(run, frame, record_ids)
+        trial = self.trial
+        if trial is None:
+            if observation.issues:
+                self.idle_evidence = ()
+            return
+        trial.add_evidence(*record_ids)
+        for issue in (*observation.issues, *(run.issues if run else ())):
+            trial.add_issue(f"UART_{issue.value}")
+        if frame is None or run is None:
+            return
+        if frame.kind == EventType.INJECT and trial.inject_tick is None:
+            state = trial.state
+            if not (
+                fresh(state, self.now_ns, STATE_LIFETIME)
+                and state.message.state == State.TEST_ACTIVE
+                and state.message.epoch == self.can.highest_epoch
+            ):
+                trial.add_issue("TEST_ACTIVE_UNOBSERVED")
+            else:
+                trial.inject_epoch = state.message.epoch
+            trial.inject_tick = frame.tick_us
+        if frame.flags & DIAG_HIGH:
+            trial.diag_seen = True
+            if trial.inject_tick is None:
+                trial.early_fault = True
+        if frame.kind == EventType.DIAG_EDGE and frame.flags & TIMING_VALID:
+            if trial.latency_us is None:
+                trial.latency_us = frame.value
+        if frame.kind in (EventType.END, EventType.ABORT) and trial.end_ns is None:
+            trial.terminal = run.status
+            trial.end_tick = frame.tick_us
+            trial.end_ns = self.now_ns
+            trial.state_at_end = trial.state
+            trial.fault_at_end = trial.fault
+
+    def _interrupt(self, run, *record_ids):
+        if self.trial is not None and self.trial.run_id == run.run_id:
+            self.trial.add_evidence(*record_ids)
+            for issue in run.issues:
+                self.trial.add_issue(f"UART_{issue.value}")
+            self._close(self.now_ns)
+        self.idle_evidence = ()
+
+    def _record_mid_run_attach(self, observation, record_ids):
+        frame = observation.frame
+        run_id = f"{observation.fpga_session}:{frame.run_seq}"
+        if self.latest_result and self.latest_result["run_id"] == run_id:
+            return
+        self.idle_evidence = ()
+        self.trial = Trial(run_id, frame.scenario, self.now_ns, None, None)
+        self.trial.add_issue("MID_RUN_ATTACH")
+        self.trial.add_evidence(*record_ids)
+        self._close(self.now_ns)
+
+    def _receive_service(self, record):
+        event = record.payload
+        trial = self.trial
+        if event == "clock":
+            if self._deadline() is not None and self.now_ns >= self._deadline():
+                self._close(self._deadline())
+            return
+        if event == "recording_failed":
+            self.healthy_recording = False
+        if event == "can_disconnect":
+            self.can.disconnect(self.now_ns)
+        if event in ("fpga_disconnect", "fpga_reconnect"):
+            operation = (
+                self.uart.disconnect
+                if event == "fpga_disconnect"
+                else self.uart.reconnect
+            )
+            operation(self.now_ns)
+            self.idle_evidence = ()
+        if trial is None:
+            return
+        trial.add_evidence(record.record_id)
+        if event in ("stop", "reset"):
+            self._mark_control_change(trial, event.upper())
+            if event == "reset" and not trial.control_after_end:
+                trial.interrupted_by = "RESET"
+                self._close(self.now_ns)
+        else:
+            trial.add_issue(event.upper())
+            self._close(self.now_ns)
+
+    def _mark_control_change(self, trial, reason):
+        if trial.terminal == RunStatus.END_RECEIVED:
+            # 조작 뒤 CAN 상태는 완료된 파형의 근거로 묶을 수 없다.
+            trial.control_after_end = True
+        else:
+            trial.interrupted_by = trial.interrupted_by or reason
+
+    def _close(self, end_ns):
+        trial = self.trial
+        if trial is not None:
+            if trial.end_ns is not None and self.uart.has_pending_frame:
+                self._mark_pending_uart(trial)
+            self.latest_result = result_context(trial, self.config, end_ns)
+            self.results.append(self.latest_result)
+            self.trial = None
+
+    def _mark_pending_uart(self, trial):
+        trial.add_issue("UART_FRAMING")
+        trial.add_evidence(*self.uart.pending_record_ids)
+
+    def finish(self):
+        self.results = []
+        if self.trial is not None:
+            if self.uart.has_pending_frame:
+                self._mark_pending_uart(self.trial)
+            observations = self.uart.finish(self.now_ns)
+            for observation in observations:
+                for issue in observation.issues:
+                    self.trial.add_issue(f"UART_{issue.value}")
+            deadline = self._deadline()
+            if deadline is None or self.now_ns < deadline:
+                self.trial.add_issue("RECORD_ENDED_EARLY")
+            self._close(
+                deadline
+                if deadline is not None and self.now_ns >= deadline
+                else self.now_ns
+            )
+        return self.results
+
+    def snapshot(self):
+        if self.trial is None:
+            return self.latest_result or {"result": "IDLE"}
+        return {
+            "run_id": self.trial.run_id,
+            "scenario_id": self.trial.scenario_id,
+            "result": "RUNNING",
+            "reason": "RESULT_PENDING" if self._deadline() else None,
+        }

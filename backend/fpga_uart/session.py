@@ -61,21 +61,31 @@ class Observation:
     run: Run | None = None
     interrupted_run: Run | None = None
     duplicate: bool = False
+    record_ids: tuple[str, ...] = ()
 
 
 class UartReceiver:
-    def __init__(self):
+    def __init__(self, session_id_factory=None):
         self.stream = FrameStream()
         self.last_rx_ns: int | None = None
         self.connected = True
+        self._session_id_factory = session_id_factory or uuid4
         self._new_session()
 
     def _new_session(self):
-        self.fpga_session = str(uuid4())
+        self.fpga_session = str(self._session_id_factory())
         self.last_frame: Frame | None = None
         self.run: Run | None = None
         self.quarantined = False
         self.fpga_invalid_latched = False
+
+    @property
+    def has_pending_frame(self) -> bool:
+        return self.stream.has_pending_frame
+
+    @property
+    def pending_record_ids(self) -> tuple[str, ...]:
+        return self.stream.pending_record_ids
 
     def _mark(self, issues):
         if self.run is not None and self.run.status == RunStatus.OPEN:
@@ -110,7 +120,9 @@ class UartReceiver:
         self.connected = True
         return interrupted
 
-    def feed(self, data: bytes, now_ns: int) -> list[Observation]:
+    def feed(
+        self, data: bytes, now_ns: int, *, record_id: str | None = None
+    ) -> list[Observation]:
         expired = self.advance(now_ns)
         if not self.connected:
             return []
@@ -127,7 +139,8 @@ class UartReceiver:
                 )
             )
         observations.extend(
-            self._observe(candidate, now_ns) for candidate in self.stream.feed(data)
+            self._observe(candidate, now_ns)
+            for candidate in self.stream.feed(data, record_id=record_id)
         )
         return observations
 
@@ -139,7 +152,11 @@ class UartReceiver:
 
     def _observe(self, candidate: FrameCandidate, now_ns: int) -> Observation:
         observation = Observation(
-            self.fpga_session, now_ns, candidate.raw, candidate.frame
+            self.fpga_session,
+            now_ns,
+            candidate.raw,
+            candidate.frame,
+            record_ids=candidate.record_ids,
         )
         frame_issues = (candidate.error,) if candidate.error is not None else ()
         if self.quarantined:

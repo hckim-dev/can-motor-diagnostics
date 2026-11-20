@@ -58,6 +58,16 @@ class FrameTest(unittest.TestCase):
         self.assertEqual(corrupt.error, FrameError.CRC)
         self.assertEqual(good.frame, decode_frame(GOLDEN))
 
+    def test_record_ids_follow_only_bytes_in_candidate(self):
+        stream = FrameStream()
+        self.assertEqual(stream.feed(b"noise\xa5", record_id="noise"), [])
+        self.assertEqual(stream.feed(GOLDEN[:10], record_id="first"), [])
+        self.assertEqual(stream.feed(GOLDEN[10:18], record_id="middle"), [])
+        split, whole = stream.feed(GOLDEN[18:] + GOLDEN, record_id="last")
+        self.assertEqual(split.record_ids, ("first", "middle", "last"))
+        self.assertEqual(whole.record_ids, ("last",))
+        self.assertEqual(stream.pending_record_ids, ())
+
     def test_finish_separates_truncation_from_a_valid_crc_suffix(self):
         # 이 STATUS의 CRC 끝 바이트가 sync의 첫 바이트와 같다.
         raw = packet(1, 93, 0)

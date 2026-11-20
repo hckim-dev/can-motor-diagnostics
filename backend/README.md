@@ -59,3 +59,19 @@ python3 -X dev -W error -m unittest discover -s tests -p 'check_fpga_uart.py' -v
 검증 CLI는 디코딩 결과·오류·관측된 회차를 JSON 줄로 출력합니다. 공통 예제는 `INJECT` 한 프레임이라 `MISSING_BASELINE`이 함께 표시됩니다. 파일 입력에는 읽은 시점의 단조 시각을 부여하고, 보드 시간은 프레임의 `tick_us`로 유지합니다. 실물 포트 설정과 연결은 7단계에서, CAN과 결합한 시험 판정은 6단계에서 검증합니다.
 
 `STATUS`에서 확인한 FPGA 오류 비트는 현재 UART 세션에 유지합니다. 이후 `STATUS`에서 비트가 내려가도 같은 세션의 새 회차에 오류를 표시합니다. 보드 리셋이나 명시적 재연결로 새 세션을 열면 다시 관측하며, FPGA가 오류를 계속 보고하면 새 세션에도 기록합니다.
+
+## 시험 판정·기록·리플레이
+
+`diagnostics`는 모의 CAN·UART 원본을 입력 순서대로 기존 수신기에 전달하고, `fpga-basic/1.0`의 `NORMAL`, `NO_EDGE`, `GAP_500`을 판정합니다. 유휴 `STATUS`, 새 `BASELINE_START`, CAN의 `TEST_ARMED`와 `TEST_ACTIVE`를 확인합니다. `END` 뒤에는 최대 500ms 동안 지연된 근거를 수집합니다. `GAP_500`은 이 구간에 새로 받은 동일 부팅·TEST 세션의 `MOTOR_STATE`와 `MOTOR_FAULT`를 요구합니다.
+
+```sh
+python3 -m backend.diagnostics record tests/fixtures/diagnostic-no-edge.jsonl \
+  .local/diagnostic-original --gpio-verified
+python3 -m backend.diagnostics replay .local/diagnostic-original \
+  .local/diagnostic-replay
+python3 -X dev -W error -m unittest discover -s tests -p 'check_diagnostics.py' -v
+```
+
+두 출력 경로에는 새 디렉터리를 지정합니다. 공통 예제의 합성 GPIO 검증 전제는 `--gpio-verified`로 적용하며, 이 옵션 없이 실행하면 `INCONCLUSIVE / TIMING_UNAVAILABLE`가 됩니다. CLI는 원본 입력 `inputs.jsonl`, CAN·UART 원본 조회용 `raw_can.jsonl`·`raw_fpga.jsonl`, 판정 및 증거 ID `events.jsonl`, 설정과 입력 해시 `manifest.json`을 저장합니다. `clock` 서비스 입력은 기록이 도달한 시각을 표시하며, 필요한 구간 전에 EOF가 오면 `INCONCLUSIVE`로 기록합니다.
+
+리플레이는 원본 설정과 입력 해시를 검사하고 원래 순서·단조 시각으로 판정합니다. 기본 재생 속도는 1배속이며 `--fast`로 대기만 건너뛸 수 있습니다. 두 방식 모두 원본 결과와 증거 ID를 대조하고 `replay_of`가 있는 별도 기록을 남깁니다. 이 CLI의 검증 범위는 시험 원본과 결과입니다. TCP 화면 전송, 연속 운전·샘플 기록과 로그 회전, 실물 CAN·UART 연결은 별도 통합 항목입니다.

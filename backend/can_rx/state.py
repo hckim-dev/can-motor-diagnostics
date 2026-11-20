@@ -92,10 +92,13 @@ class CanReceiver:
         self.last_ns = now_ns
         self.samples.advance(now_ns)
 
-    def ingest(self, frame, now_ns):
+    def ingest(self, frame, now_ns, *, ingest_seq=None):
         self.advance(now_ns)
+        next_seq = self.ingest_seq + 1 if ingest_seq is None else ingest_seq
+        if next_seq <= self.ingest_seq:
+            raise ValueError("CAN 수신 순번은 증가해야 한다")
         self.connected = True
-        self.ingest_seq += 1
+        self.ingest_seq = next_seq
         record_id = f"{self.backend_session}:{self.ingest_seq}"
 
         try:
