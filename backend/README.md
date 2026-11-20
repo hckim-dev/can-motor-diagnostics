@@ -75,3 +75,27 @@ python3 -X dev -W error -m unittest discover -s tests -p 'check_diagnostics.py' 
 두 출력 경로에는 새 디렉터리를 지정합니다. 공통 예제의 합성 GPIO 검증 전제는 `--gpio-verified`로 적용하며, 이 옵션 없이 실행하면 `INCONCLUSIVE / TIMING_UNAVAILABLE`가 됩니다. CLI는 원본 입력 `inputs.jsonl`, CAN·UART 원본 조회용 `raw_can.jsonl`·`raw_fpga.jsonl`, 판정 및 증거 ID `events.jsonl`, 설정과 입력 해시 `manifest.json`을 저장합니다. `clock` 서비스 입력은 기록이 도달한 시각을 표시하며, 필요한 구간 전에 EOF가 오면 `INCONCLUSIVE`로 기록합니다.
 
 리플레이는 원본 설정과 입력 해시를 검사하고 원래 순서·단조 시각으로 판정합니다. 기본 재생 속도는 1배속이며 `--fast`로 대기만 건너뛸 수 있습니다. 두 방식 모두 원본 결과와 증거 ID를 대조하고 `replay_of`가 있는 별도 기록을 남깁니다. 이 CLI의 검증 범위는 시험 원본과 결과입니다. TCP 화면 전송, 연속 운전·샘플 기록과 로그 회전, 실물 CAN·UART 연결은 별도 통합 항목입니다.
+
+## Jetson 실물 연결 확인
+
+Jetson의 Linux aarch64, Python 3.10 환경에서 아래 명령을 사용합니다. `CAN_IFACE`에는 125 kbit/s Classical CAN으로 준비된 SocketCAN 인터페이스 이름을, `FPGA_TTY`에는 Basys3 전용 `/dev/serial/by-id/...` 경로를 지정합니다. `ip -details link`와 `/dev/serial/by-id`에서 장치를 확인합니다. 수신기는 CAN 인터페이스 설정을 변경하지 않습니다. UART는 115200 8N1로 읽고 종료 시 이전 설정을 복구합니다.
+
+```sh
+python3 -m backend.hardware capture .local/can-rx --can "$CAN_IFACE" --seconds 5
+python3 -m backend.hardware capture .local/fpga-rx --uart "$FPGA_TTY" --seconds 5
+```
+
+각 결과에 `ok`와 받은 프레임 수가 표시됩니다. CAN은 외부 노드의 호환 `MOTOR_HELLO`와 유효한 `MOTOR_STATE`, UART는 유효한 프레임을 각각 확인합니다. `--can`과 `--uart`를 함께 지정하면 두 입력을 같은 순번으로 기록합니다. 완료된 수신 기록은 `python3 -m backend.diagnostics replay .local/can-rx .local/can-rx-replay --fast`로 재생할 수 있습니다. 수신 중 애플리케이션은 CAN 프레임을 송신하지 않습니다. CAN 컨트롤러 자체의 ACK 동작은 인터페이스 모드에 따릅니다.
+
+수신 확인을 마친 뒤, 모터 6V 전원을 물리적으로 분리하고 MCU와 CAN 트랜시버의 로직 전원은 유지합니다. 버스와 종단을 확인한 상태에서 별도로 아래 명령을 실행합니다.
+
+```sh
+python3 -m backend.hardware can-tx-probe --can "$CAN_IFACE" \
+  --boot-id-file .local/jetson-operator-boot-id --motor-power-off
+```
+
+이 명령은 CAN 2.1 `OP_HELLO` 한 프레임을 제출합니다. `--motor-power-off`는 작업자의 확인입니다. `socket_echo`는 로컬 소켓의 확인이며, 실물 송신은 별도 CAN 수신 노드나 분석기에서 `0x701`과 출력된 payload를 대조해 확인합니다. 부팅 ID 파일은 동일 조작 노드의 재실행에서 재사용합니다. [Linux SocketCAN](https://docs.kernel.org/networking/can.html)
+
+```sh
+python3 -X dev -W error -m unittest discover -s tests -p 'check_hardware.py' -v
+```

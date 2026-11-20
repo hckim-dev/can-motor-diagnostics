@@ -98,7 +98,7 @@ def verify_source(source, manifest):
 
 
 class Journal:
-    def __init__(self, directory, config, *, original=None):
+    def __init__(self, directory, config, *, original=None, hardware=None):
         self.directory = directory
         self.backend_session = str(uuid4())
         self.evidence_session = (
@@ -110,7 +110,7 @@ class Journal:
             "backend_version": f"diagnostics/{FORMAT_VERSION}",
             "protocol_version": PROTOCOL_VERSION,
             "firmware_build": {"motor": None, "fpga": None},
-            "source": "replay" if original else "mock",
+            "source": "replay" if original else "live" if hardware else "mock",
             "backend_session": self.backend_session,
             "evidence_session": self.evidence_session,
             "replay_of": original["backend_session"] if original else None,
@@ -118,6 +118,8 @@ class Journal:
             "config": asdict(config),
             "started_utc": utc_now(),
         }
+        if hardware or (original and "hardware" in original):
+            self.manifest["hardware"] = hardware or original["hardware"]
         self._stack = ExitStack()
         self._digest = sha256()
 
@@ -216,6 +218,13 @@ class Journal:
         return event["context"]
 
 
+def record_input(journal, engine, record, *, original_utc=None, replay_ns=None):
+    row = journal.input(record, original_utc, replay_ns)
+    received, completed = engine.ingest(record)
+    journal.project(row, received, engine)
+    return received, [journal.result(context) for context in completed]
+
+
 def evaluate(source, journal, config, *, pace=None):
     if journal.original:
         verify_source(source, journal.original)
@@ -225,10 +234,10 @@ def evaluate(source, journal, config, *, pace=None):
         source, journal.evidence_session, recorded=journal.original is not None
     ):
         replay_ns = pace(record.rx_mono_ns) if pace else None
-        row = journal.input(record, original_utc, replay_ns)
-        received, completed = engine.ingest(record)
-        journal.project(row, received, engine)
-        results.extend(journal.result(context) for context in completed)
+        _, completed = record_input(
+            journal, engine, record, original_utc=original_utc, replay_ns=replay_ns
+        )
+        results.extend(completed)
     journal.verify_input()
     results.extend(journal.result(context) for context in engine.finish())
     return results
