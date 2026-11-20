@@ -102,9 +102,11 @@ python3 -m backend.monitor .local/monitor-run \
 
 저장이 지연되어도 각 TCP 송신 시점의 상태·허가·측정값 유효 기간을 적용합니다.
 
-예제는 원본 시각 간격을 따라 입력을 공급하며, 끝까지 처리한 뒤에도 TCP 관측을 유지합니다. 장치가 단절되면 해당 입력을 `OFFLINE`으로 표시하고 다른 입력과 TCP 관측을 계속합니다. 실물 장치의 재등록은 서비스를 다시 시작해 진행합니다. Ctrl+C 또는 SIGTERM으로 종료하면 관측한 입력까지만 마감하고, 정상적으로 동기화한 뒤 `manifest.json`을 게시합니다.
+예제는 원본 시각 간격을 따라 입력을 공급하며, 끝까지 처리한 뒤에도 TCP 관측을 유지합니다. 장치가 단절되면 해당 입력을 `OFFLINE`으로 표시하고 다른 입력과 TCP 관측을 계속합니다. FPGA UART를 다시 등록하려면 서비스를 재시작합니다. Ctrl+C 또는 SIGTERM으로 종료하면 관측한 입력까지만 마감하고, 정상적으로 동기화한 뒤 `manifest.json`을 게시합니다.
 
 장비를 연결한 환경에서는 `--can "$CAN_IFACE" --uart "$FPGA_TTY"`로 수신 전용 관측을 실행할 수 있습니다. 실물 수신에서 시험은 기능 관측으로 기록합니다. 이 서비스의 자체 CAN 송신은 없습니다. 장치 준비 방법은 아래 절을 참조합니다.
+
+CAN 소켓이 열리지 않거나 bus-off·소켓 오류로 단절되면, 직전 실패 또는 단절 후 1초, 2초, 4초 간격으로 최대 세 번 새 소켓을 엽니다. 호환 `MOTOR_HELLO`와 같은 epoch의 새 `MOTOR_STATE`를 받아야 `OK`로 돌아옵니다. 최신 모터 상태가 60초 동안 연속 관측되면 재시도 한도가 초기화됩니다. 재시도를 소진하면 서비스를 재시작해 다시 시도할 수 있습니다. Backend는 CAN 인터페이스 설정과 컨트롤러 재시작을 운영체제에 맡깁니다.
 
 ## Jetson 실물 연결 확인
 
@@ -116,6 +118,8 @@ python3 -m backend.hardware capture .local/fpga-rx --uart "$FPGA_TTY" --seconds 
 ```
 
 각 결과에 `ok`와 받은 프레임 수가 표시됩니다. CAN은 외부 노드의 호환 `MOTOR_HELLO`와 유효한 `MOTOR_STATE`, UART는 유효한 프레임을 각각 확인합니다. `--can`과 `--uart`를 함께 지정하면 두 입력을 같은 순번으로 기록합니다. 완료된 수신 기록은 `python3 -m backend.diagnostics replay .local/can-rx .local/can-rx-replay --fast`로 재생할 수 있습니다. 수신 중 애플리케이션은 CAN 프레임을 송신하지 않습니다. CAN 컨트롤러 자체의 ACK 동작은 인터페이스 모드에 따릅니다.
+
+수신 점검과 통합 서비스는 `manifest.json`의 `can_rx`에 두 지표를 남깁니다. `socket_dropped_frames`는 커널이 수신 소켓 큐에서 떨어뜨렸다고 보고한 프레임 수입니다. `unobserved_sample_sequences`는 같은 수집 구간에서 수락된 `SAMPLE_TIME`의 순번 공백 수입니다. 두 지표는 서로 다른 위치의 관측값입니다. `inputs.jsonl`에는 드롭 수, 단절 사유, 소켓 재연결 결과가 남고, `raw_can.jsonl`에는 공백을 발견한 프레임의 `sample_seq_gap`이 남습니다. 큐 드롭을 감지하면 진행 중인 시험은 판정 불가로 처리하고 REAL 회차와 샘플 결합을 새 구간으로 분리합니다.
 
 수신 확인을 마친 뒤, 모터 6V 전원을 물리적으로 분리하고 MCU와 CAN 트랜시버의 로직 전원은 유지합니다. 버스와 종단을 확인한 상태에서 별도로 아래 명령을 실행합니다.
 

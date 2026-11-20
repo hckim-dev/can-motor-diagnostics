@@ -7,11 +7,20 @@ from ..can_rx.codec import Frame
 SERVICES = {
     "clock",
     "can_disconnect",
+    "can_reconnect",
+    "can_retry_failed",
+    "can_rx_overflow",
     "fpga_disconnect",
     "fpga_reconnect",
     "stop",
     "reset",
     "recording_failed",
+}
+CAN_SERVICE_FIELDS = {
+    "can_disconnect": {"reason"},
+    "can_reconnect": {"attempt"},
+    "can_retry_failed": {"attempt", "reason"},
+    "can_rx_overflow": {"dropped"},
 }
 
 
@@ -22,6 +31,7 @@ class Input:
     rx_mono_ns: int
     source: str
     payload: Frame | bytes | str
+    detail: dict | None = None
 
     @property
     def record_id(self) -> str:
@@ -53,7 +63,27 @@ class Input:
             payload = row["event"]
         else:
             raise ValueError("지원하지 않는 판정 입력")
-        record = cls(session, seq, int(raw_time), source, payload)
+        detail = row.get("detail")
+        if "detail" in row:
+            if (
+                source != "service"
+                or not isinstance(detail, dict)
+                or detail.keys() != CAN_SERVICE_FIELDS.get(payload)
+                or ("reason" in detail and not isinstance(detail["reason"], str))
+                or any(
+                    type(value) is not int or value <= 0
+                    for key, value in detail.items()
+                    if key in ("attempt", "dropped")
+                )
+            ):
+                raise ValueError("CAN 서비스 세부 정보 형식 오류")
+        elif source == "service" and payload in (
+            "can_reconnect",
+            "can_retry_failed",
+            "can_rx_overflow",
+        ):
+            raise ValueError("CAN 서비스 세부 정보 누락")
+        record = cls(session, seq, int(raw_time), source, payload, detail)
         for name in ("backend_session", "ingest_seq", "record_id"):
             if name in row and row[name] != getattr(record, name):
                 raise ValueError("기록의 세션 또는 입력 순번 불일치")
@@ -80,4 +110,6 @@ class Input:
             row["hex"] = self.payload.hex(" ")
         else:
             row["event"] = self.payload
+            if self.detail is not None:
+                row["detail"] = self.detail
         return row

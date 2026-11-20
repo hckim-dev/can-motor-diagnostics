@@ -10,13 +10,21 @@ from ..diagnostics.inputs import Input
 from ..diagnostics.journal import FLUSH_INTERVAL_NS, Journal, record_input
 from ..diagnostics.verdict import Config
 from ..fpga_uart.session import Issue
-from .socketcan import CAN_ERR_BUSOFF, open_can, read_external_frame
+from .socketcan import (
+    CAN_ERR_BUSOFF,
+    CanDropCounter,
+    CanRead,
+    can_error_reason,
+    open_can,
+    read_can_observation,
+)
 from .uart import open_uart, read_uart
 
 TIME_UNIT_NS = 1_000_000_000
 
 
 def receive_inputs(devices, readers, duration_ns):
+    drops = CanDropCounter()
     with selectors.DefaultSelector() as selector:
         for source, device in devices.items():
             selector.register(device, selectors.EVENT_READ, source)
@@ -29,7 +37,7 @@ def receive_inputs(devices, readers, duration_ns):
                 break
             if now >= next_clock:
                 next_clock = now + FLUSH_INTERVAL_NS
-                yield now, "service", "clock", None
+                yield now, "service", "clock", None, None
                 continue
             timeout = (min(deadline, next_clock) - now) / TIME_UNIT_NS
             for key, _ in selector.select(timeout):
@@ -46,33 +54,62 @@ def receive_inputs(devices, readers, duration_ns):
                         break
                     selector.unregister(key.fileobj)
                     event = "can_disconnect" if source == "can" else "fpga_disconnect"
-                    yield now, "service", event, str(exc)
-                    continue
-                if payload is None:
+                    detail = (
+                        {"reason": can_error_reason(exc)} if source == "can" else None
+                    )
+                    yield now, "service", event, str(exc), detail
                     continue
                 now = time.monotonic_ns()
                 if now > deadline:
                     break
-                yield now, source, payload, None
+                if isinstance(payload, CanRead):
+                    if delta := drops.observe(payload.dropped_total):
+                        yield (
+                            now,
+                            "service",
+                            "can_rx_overflow",
+                            f"SocketCAN 수신 큐 드롭 {delta}건",
+                            {"dropped": delta},
+                        )
+                    if payload.error is not None:
+                        selector.unregister(key.fileobj)
+                        yield (
+                            now,
+                            "service",
+                            "can_disconnect",
+                            str(payload.error),
+                            {"reason": can_error_reason(payload.error)},
+                        )
+                        continue
+                    payload = payload.frame
+                if payload is None:
+                    continue
+                yield now, source, payload, None, None
                 if (
                     source == "can"
                     and payload.error
                     and payload.can_id & CAN_ERR_BUSOFF
                 ):
                     selector.unregister(key.fileobj)
-                    yield now, "service", "can_disconnect", "CAN bus-off"
+                    yield (
+                        now,
+                        "service",
+                        "can_disconnect",
+                        "CAN bus-off",
+                        {"reason": "BUS_OFF"},
+                    )
         # 저장 지연으로 마감을 넘겨도 이후 시간을 관측 근거로 쓰지 않는다.
-        yield min(time.monotonic_ns(), deadline), "service", "clock", None
+        yield min(time.monotonic_ns(), deadline), "service", "clock", None, None
 
 
 def capture(devices, readers, journal, config, duration_ns):
     engine = journal.new_engine(config)
     counts = Counter()
     errors = []
-    for seq, (now, source, payload, error) in enumerate(
+    for seq, (now, source, payload, error, detail) in enumerate(
         receive_inputs(devices, readers, duration_ns), 1
     ):
-        record = Input(journal.evidence_session, seq, now, source, payload)
+        record = Input(journal.evidence_session, seq, now, source, payload, detail)
         received, _ = record_input(journal, engine, record)
         if error:
             errors.append(error)
@@ -97,6 +134,8 @@ def capture(devices, readers, journal, config, duration_ns):
                 ):
                     counts["fpga_frames"] += 1
     journal.finish(engine)
+    if "can" in devices:
+        counts.update(journal.manifest["can_rx"])
 
     missing = []
     if "can" in devices and not counts["can_motor_states"]:
@@ -113,11 +152,13 @@ def capture(devices, readers, journal, config, duration_ns):
 def capture_hardware(output, interface, uart, duration_ns):
     config = Config(functional_only=True)
     devices = {}
-    readers = {"can": read_external_frame, "fpga": read_uart}
+    readers = {"can": read_can_observation, "fpga": read_uart}
     hardware = {"can_interface": interface, "fpga_uart": str(uart) if uart else None}
     with ExitStack() as stack:
         if interface:
-            devices["can"] = stack.enter_context(open_can(interface))
+            devices["can"] = stack.enter_context(
+                open_can(interface, count_overflow=True)
+            )
         if uart:
             devices["fpga"] = stack.enter_context(open_uart(uart))
         with Journal(output, config, hardware=hardware) as journal:

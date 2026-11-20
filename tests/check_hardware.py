@@ -136,9 +136,9 @@ class CaptureTest(unittest.TestCase):
                 {"fpga": lambda _: b"data", "can": late_reader},
                 10,
             )
-            self.assertEqual(next(records), (0, "fpga", b"data", None))
+            self.assertEqual(next(records), (0, "fpga", b"data", None, None))
             now = 11
-            self.assertEqual(list(records), [(10, "service", "clock", None)])
+            self.assertEqual(list(records), [(10, "service", "clock", None, None)])
         late_reader.assert_not_called()
 
     def test_uart_session_discontinuity_fails_capture_after_a_valid_frame(self):

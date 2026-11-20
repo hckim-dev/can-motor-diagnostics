@@ -138,6 +138,7 @@ class SampleAssembler:
         self.on_sample = on_sample
         self.new_acquisition_id = new_acquisition_id
         self.pending: dict[int, PendingSample] = {}
+        self.sequence_gaps = 0
         self.reset()
 
     def reset(self):
@@ -202,6 +203,7 @@ class SampleAssembler:
             tick_delta = forward_delta(message.tick_ms, last.tick_ms, TICK_MASK)
             if not 1 <= delta < SEQUENCE_HALF or tick_delta > TICK_MASK // 2:
                 return False
+            self.sequence_gaps += delta - 1
 
         self.seq64 = message.seq if self.seq64 is None else self.seq64 + delta
         pending.seq64 = self.seq64

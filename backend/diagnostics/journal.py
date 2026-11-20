@@ -216,8 +216,9 @@ class Journal:
         for file in self.files.values():
             file.flush()
 
-    def project(self, row, received):
+    def project(self, row, received, sample_gap=0):
         if row["source"] == "can":
+            gap = {"sample_seq_gap": sample_gap} if sample_gap else {}
             self.files["raw_can.jsonl"].write(
                 json_line(
                     {
@@ -227,6 +228,7 @@ class Journal:
                         ),
                         "motor_boot": message_motor_boot(received.message),
                         "decode_error": received.error,
+                        **gap,
                     }
                 )
             )
@@ -269,14 +271,20 @@ class Journal:
         self.measurements.finish(engine)
         results = [self.result(context) for context in engine.finish()]
         self.flush()
+        self.manifest["can_rx"] = {
+            "socket_dropped_frames": engine.can_socket_drops,
+            "unobserved_sample_sequences": engine.can.samples.sequence_gaps,
+        }
         self._needs_finish = False
         return results
 
 
 def record_input(journal, engine, record, *, original_utc=None, replay_ns=None):
     row = journal.input(record, original_utc, replay_ns)
+    previous_gap_count = engine.can.samples.sequence_gaps
     received, completed = engine.ingest(record)
-    journal.project(row, received)
+    sample_gap = engine.can.samples.sequence_gaps - previous_gap_count
+    journal.project(row, received, sample_gap)
     journal.measurements.project(record, row, received, engine)
     journal.flush_due(record)
     return received, [journal.result(context) for context in completed]

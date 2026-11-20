@@ -14,6 +14,7 @@ class Monitor:
         self.journal = journal
         self.engine = journal.new_engine(config)
         self.feed = feed
+        self.observe_can = getattr(feed, "observe_can", None)
         self.fpga_last_ns = None
         self.fpga_degraded = False
         self.events = []
@@ -71,13 +72,14 @@ class Monitor:
         )
 
     def _consume(self, batch):
-        for now, source, payload in batch:
+        for now, source, payload, *detail in batch:
             record = Input(
                 self.journal.evidence_session,
                 self.engine.ingest_seq + 1,
                 now,
                 source,
                 payload,
+                *detail,
             )
             received, _ = record_input(self.journal, self.engine, record)
             if source == "fpga":
@@ -108,6 +110,8 @@ class Monitor:
             # 쓰기 작업이 끝난 뒤에만 호출자가 파일을 닫을 수 있다.
             await task
             raise
+        if self.observe_can is not None:
+            self.observe_can(snapshot)
         self.stream.publish(snapshot, events)
 
     async def run(self, stop):

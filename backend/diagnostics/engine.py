@@ -41,6 +41,7 @@ class DiagnosticEngine:
         self.ingest_seq = 0
         self.results = []
         self.latest_result = None
+        self.can_socket_drops = 0
 
     def _next_acquisition(self):
         self._can_generation += 1
@@ -71,7 +72,9 @@ class DiagnosticEngine:
         self.now_ns = now = record.rx_mono_ns
         self.results = []
 
-        if self._deadline() is not None and now > self._deadline():
+        # 드롭은 이전 수신 이후 어느 시점에 발생했는지 알 수 없다.
+        overflow = record.source == "service" and record.payload == "can_rx_overflow"
+        if not overflow and self._deadline() is not None and now > self._deadline():
             self._close(self._deadline())
         if self.trial and self.trial.end_ns is None:
             if expired := self.uart.advance(now):
@@ -334,7 +337,11 @@ class DiagnosticEngine:
         if event == "recording_failed":
             self.healthy_recording = False
             self.can.samples.reset()
-        if event == "can_disconnect":
+        if event in ("can_reconnect", "can_retry_failed"):
+            return
+        if event == "can_rx_overflow":
+            self.can_socket_drops += record.detail["dropped"]
+        if event in ("can_disconnect", "can_rx_overflow"):
             self.can.disconnect(self.now_ns)
         if event in ("fpga_disconnect", "fpga_reconnect"):
             operation = (

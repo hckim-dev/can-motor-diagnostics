@@ -67,6 +67,7 @@ class OperationTracker:
         old_hello, self.hello = self.hello, can.hello
         if record.source == "service" and record.payload in (
             "can_disconnect",
+            "can_rx_overflow",
             "recording_failed",
         ):
             self.close(record.payload.upper(), now, row=row)

@@ -4,11 +4,12 @@ import argparse
 import asyncio
 import termios
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 
 from ..diagnostics.journal import Journal
 from ..diagnostics.verdict import Config
-from ..hardware.socketcan import open_can, read_external_frame
+from ..hardware.socketcan import open_can, read_can_observation
 from ..hardware.uart import open_uart, read_uart
 from ..tcp_stream import PORT, listen, shutdown_signal
 from .inputs import DeviceFeed, FixtureFeed
@@ -49,8 +50,6 @@ def main():
                 file = stack.enter_context(args.fixture.open(encoding="utf-8"))
             else:
                 devices = {}
-                if args.can:
-                    devices["can"] = stack.enter_context(open_can(args.can))
                 if args.uart:
                     devices["fpga"] = stack.enter_context(open_uart(args.uart))
                 hardware = {
@@ -64,7 +63,13 @@ def main():
                 FixtureFeed(file, journal.evidence_session)
                 if args.fixture
                 else DeviceFeed(
-                    devices, {"can": read_external_frame, "fpga": read_uart}
+                    devices,
+                    {"can": read_can_observation, "fpga": read_uart},
+                    can_open=(
+                        partial(open_can, args.can, count_overflow=True)
+                        if args.can
+                        else None
+                    ),
                 )
             )
             asyncio.run(serve(journal, config, feed, args.host, args.port))
