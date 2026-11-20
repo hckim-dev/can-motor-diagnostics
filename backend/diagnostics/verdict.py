@@ -52,7 +52,7 @@ class Trial:
     diag_seen: bool = False
     early_fault: bool = False
     normal_state_deviation: bool = False
-    expected_fault_seen: bool = False
+    expected_fault_epoch: int | None = None
     interrupted_by: str | None = None
     control_after_end: bool = False
     state: Observation | None = None
@@ -63,6 +63,7 @@ class Trial:
     gap_state: Observation | None = None
     gap_fault: Observation | None = None
     gap_fault_cleared: bool = False
+    baseline_accepted: bool = False
 
     def add_evidence(self, *ids):
         self.evidence.update(dict.fromkeys(ids))
@@ -157,8 +158,10 @@ def decide(trial, config):
     if trial.latency_us > config.gpio_limit_us:
         return "FAIL", "GPIO_LATENCY_EXCEEDED"
     if trial.scenario_id == 3:
-        if not trial.expected_fault_seen:
+        if trial.expected_fault_epoch is None:
             return "INCONCLUSIVE", "GAP_INITIAL_FAULT_UNOBSERVED"
+        if trial.gap_state.message.epoch != trial.expected_fault_epoch:
+            return "INCONCLUSIVE", "GAP_RECOVERY_EPOCH_CHANGED"
     return "PASS", "EXPECTED_FAULT_CONFIRMED"
 
 

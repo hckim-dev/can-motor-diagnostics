@@ -74,7 +74,20 @@ python3 -X dev -W error -m unittest discover -s tests -p 'check_diagnostics.py' 
 
 두 출력 경로에는 새 디렉터리를 지정합니다. 공통 예제의 합성 GPIO 검증 전제는 `--gpio-verified`로 적용하며, 이 옵션 없이 실행하면 `INCONCLUSIVE / TIMING_UNAVAILABLE`가 됩니다. CLI는 원본 입력 `inputs.jsonl`, CAN·UART 원본 조회용 `raw_can.jsonl`·`raw_fpga.jsonl`, 판정 및 증거 ID `events.jsonl`, 설정과 입력 해시 `manifest.json`을 저장합니다. `clock` 서비스 입력은 기록이 도달한 시각을 표시하며, 필요한 구간 전에 EOF가 오면 `INCONCLUSIVE`로 기록합니다.
 
-리플레이는 원본 설정과 입력 해시를 검사하고 원래 순서·단조 시각으로 판정합니다. 기본 재생 속도는 1배속이며 `--fast`로 대기만 건너뛸 수 있습니다. 두 방식 모두 원본 결과와 증거 ID를 대조하고 `replay_of`가 있는 별도 기록을 남깁니다. 이 CLI의 검증 범위는 시험 원본과 결과입니다. TCP 화면 전송, 연속 운전·샘플 기록과 로그 회전, 실물 CAN·UART 연결은 별도 통합 항목입니다.
+리플레이는 원본 설정과 입력 해시를 검사하고 원래 순서·단조 시각으로 판정합니다. 기본 재생 속도는 1배속이며 `--fast`로 대기만 건너뛸 수 있습니다. 결과와 증거 ID를 대조하고 `replay_of`가 있는 별도 디렉터리에 판정·샘플·운전 회차를 재구성합니다.
+
+### 측정값과 REAL 운전 회차
+
+모의 입력 기록과 Jetson 수집 모두 다음 파일을 생성합니다.
+
+- `samples.csv`에는 수집 구간과 확장 순번, `SAMPLE_TIME`의 수신 시각, 단위별 측정값과 유효성, 원본 프레임 ID를 남깁니다. 시간 프레임으로 부팅을 확인한 부분 샘플도 보존하며 결측·무효·만료 값은 빈 칸입니다. 행은 샘플 결합 완료 순서로 기록하므로 순번으로 정렬해서 볼 수 있습니다.
+- `operations.jsonl`에는 REAL `RUNNING` 관측 구간별로 UUID, 시작·종료 경계와 관측 여부, 사유, 관련 원본 ID를 한 줄로 기록합니다. 직전의 최신 `STOPPED`를 확인했으면 `start_observed=true`입니다. 정지·고장·모드 변경을 관측하면 `end_observed=true`이며, 단절·만료·부팅 변경·기록 종료로 닫힌 구간은 `false`입니다. 이후 RUNNING을 다시 관측하면 새 UUID를 발급합니다.
+
+샘플의 `SAMPLE_TIME`과 `ELECTRIC`이 같은 회차에서 수신됐을 때 REAL 샘플에는 `operation_id`, 수락된 TEST 회차 샘플에는 `run_id`를 붙입니다. 정지 중이나 회차를 확인할 수 없는 샘플은 두 칸을 비워 둡니다. 리플레이에서도 원본 증거 ID와 회차 ID가 유지되며, 이전 기록도 원본 입력에서 이 두 파일을 생성할 수 있습니다.
+
+`raw_can.jsonl`의 `motor_boot`는 프레임에서 읽은 부팅 번호입니다. 부팅 번호나 모터 epoch가 없는 프레임은 `null`이며, 결합된 측정값의 부팅 번호와 원본 프레임 목록은 `samples.csv`에서 확인합니다.
+
+수집 중 버퍼를 주기적으로 비우고, 판정 증거 및 기록 완료 시 파일을 동기화합니다. 저장에 실패하면 오류를 보고하고 완료 `manifest.json`을 게시하지 않습니다.
 
 ## Jetson 실물 연결 확인
 

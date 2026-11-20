@@ -62,14 +62,26 @@ class Sample:
     timing: SamplePart
     speed: SamplePart | None
     electric: SamplePart | None
-    invalid_ids: tuple[str, ...]
+    invalid_parts: tuple[tuple[CanId, str], ...]
 
     @property
     def evidence_ids(self):
         parts = (self.speed, self.electric, self.timing)
+        return tuple(part.record_id for part in parts if part is not None) + tuple(
+            record_id for _, record_id in self.invalid_parts
+        )
+
+    @property
+    def complete(self):
+        return self.speed is not None and self.electric is not None
+
+    def sensor_age_ns(self, now_ns):
+        if self.electric is None or self.electric.message.sensor_age_ms is None:
+            return None
         return (
-            tuple(part.record_id for part in parts if part is not None)
-            + self.invalid_ids
+            self.electric.message.sensor_age_ms * NS_PER_MS
+            + now_ns
+            - self.electric.received_ns
         )
 
     def snapshot(self, now_ns):
@@ -85,17 +97,13 @@ class Sample:
             and now_ns - self.electric.received_ns < SAMPLE_LIFETIME
         )
 
-        sensor_age = None
-        sensor_recent = False
-        if electric and electric.sensor_age_ms is not None:
-            age_ns = electric.sensor_age_ms * NS_PER_MS + now_ns - self.electric.received_ns
-            sensor_age = age_ns // NS_PER_MS
-            sensor_recent = age_ns <= SENSOR_LIFETIME
+        age_ns = self.sensor_age_ns(now_ns)
+        sensor_age = age_ns // NS_PER_MS if age_ns is not None else None
+        sensor_recent = age_ns is not None and age_ns <= SENSOR_LIFETIME
 
-        complete = speed is not None and electric is not None
-        if self.invalid_ids:
+        if self.invalid_parts:
             quality = "invalid"
-        elif not complete or None in (
+        elif not self.complete or None in (
             speed.actual_rpm,
             speed.target_rpm,
             speed.pwm_permille,
@@ -117,7 +125,7 @@ class Sample:
             "current_ma": electric.current_ma if sensor_recent else None,
             "bus_mv": electric.bus_mv if sensor_recent else None,
             "sensor_age_ms": sensor_age,
-            "sample_complete": complete,
+            "sample_complete": self.complete,
             "quality": quality,
             "sample_mode": electric.mode.name if electric_recent else "UNKNOWN",
             "sample_state": electric.state.name if electric_recent else "UNKNOWN",
@@ -126,12 +134,17 @@ class Sample:
 
 
 class SampleAssembler:
-    def __init__(self):
+    def __init__(self, *, on_sample=None, new_acquisition_id=uuid4):
+        self.on_sample = on_sample
+        self.new_acquisition_id = new_acquisition_id
+        self.pending: dict[int, PendingSample] = {}
         self.reset()
 
     def reset(self):
-        self.pending: dict[int, PendingSample] = {}
-        self.acquisition_id = str(uuid4())
+        if self.on_sample is not None:
+            self.flush()
+        self.pending.clear()
+        self.acquisition_id = str(self.new_acquisition_id())
         self.last_time: SamplePart | None = None
         self.seq64: int | None = None
         self.latest: Sample | None = None
@@ -142,6 +155,10 @@ class SampleAssembler:
                 self.finish(seq)
         if self.last_time and now_ns - self.last_time.received_ns >= SEQUENCE_GAP:
             self.reset()
+
+    def flush(self):
+        for seq in tuple(self.pending):
+            self.finish(seq)
 
     def discard_unanchored(self, seq):
         pending = self.pending.get(seq)
@@ -195,15 +212,19 @@ class SampleAssembler:
         pending = self.pending.pop(seq)
         timing = pending.parts.get(CanId.SAMPLE_TIME)
         # 시간 프레임이 없으면 측정값을 현재 부팅에 귀속할 수 없다.
-        if timing is None or (self.latest and pending.seq64 <= self.latest.seq64):
+        if timing is None:
             return
 
-        self.latest = Sample(
+        sample = Sample(
             timing.message.boot,
             self.acquisition_id,
             pending.seq64,
             timing,
             pending.parts.get(CanId.SPEED),
             pending.parts.get(CanId.ELECTRIC),
-            tuple(pending.invalid_ids.values()),
+            tuple(pending.invalid_ids.items()),
         )
+        if self.latest is None or sample.seq64 > self.latest.seq64:
+            self.latest = sample
+        if self.on_sample is not None:
+            self.on_sample(sample)

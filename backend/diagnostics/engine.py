@@ -3,6 +3,7 @@
 from uuid import UUID, uuid5
 
 from ..can_rx.codec import SUPPLY_PRESENT, SUPPLY_VALID, CanId, Mode, State
+from ..can_rx.samples import SampleAssembler
 from ..can_rx.state import FAULT_LIFETIME, NC2_OPEN, STATE_LIFETIME, CanReceiver, fresh
 from ..fpga_uart.codec import DIAG_HIGH, READY_HIGH, TIMING_VALID, EventType, Phase
 from ..fpga_uart.session import RunStatus, UartReceiver
@@ -20,11 +21,17 @@ CONTROL_FRAMES = {CanId.MOTOR_HELLO, CanId.MOTOR_STATE, CanId.MOTOR_FAULT}
 
 
 class DiagnosticEngine:
-    def __init__(self, backend_session: str, config):
+    def __init__(self, backend_session: str, config, *, on_sample=None):
         self.backend_session = backend_session
         self.config = config
-        self.can = CanReceiver(backend_session)
         self._namespace = UUID(backend_session)
+        self._can_generation = 0
+        self.can = CanReceiver(
+            backend_session,
+            samples=SampleAssembler(
+                on_sample=on_sample, new_acquisition_id=self._next_acquisition
+            ),
+        )
         self._uart_generation = 0
         self.uart = UartReceiver(self._next_uart_session)
         self.idle_evidence: tuple[str, ...] = ()
@@ -34,6 +41,10 @@ class DiagnosticEngine:
         self.ingest_seq = 0
         self.results = []
         self.latest_result = None
+
+    def _next_acquisition(self):
+        self._can_generation += 1
+        return uuid5(self._namespace, f"can:{self._can_generation}")
 
     def _next_uart_session(self):
         self._uart_generation += 1
@@ -66,6 +77,9 @@ class DiagnosticEngine:
             if expired := self.uart.advance(now):
                 self._interrupt(expired, record.record_id)
         self._check_can_interval(now)
+
+        if record.source != "can":
+            self.can.advance(now)
 
         observations = None
         if record.source == "can":
@@ -132,14 +146,15 @@ class DiagnosticEngine:
                 trial.active_seen |= message.state == State.TEST_ACTIVE
                 if trial.inject_tick is not None and message.state != State.TEST_ACTIVE:
                     trial.normal_state_deviation = True
-            elif self.now_ns > trial.end_ns:
+            else:
+                # 같은 시각이면 END와 CAN 프레임의 입력 순서로 구분한다.
                 trial.gap_state = received
         else:
             trial.fault = received
             trial.observed_faults |= message.mask
             if trial.inject_tick is None:
                 trial.early_fault |= bool(message.mask)
-            if trial.end_ns is not None and self.now_ns > trial.end_ns:
+            if trial.end_ns is not None:
                 trial.gap_fault = received
         if (
             trial.scenario_id == 3
@@ -155,15 +170,15 @@ class DiagnosticEngine:
             trial.inject_tick is not None
             and trial.inject_epoch is not None
             and trial.end_ns is None
+            and trial.expected_fault_epoch is None
             and corroborated(trial.state, trial.fault)
+            and trial.state.message.state == State.FAULT
+            and trial.state.message.epoch > trial.inject_epoch
+            and trial.fault.message.mask == FEEDBACK_MISSING
+            and fresh(trial.state, self.now_ns, STATE_LIFETIME)
+            and fresh(trial.fault, self.now_ns, FAULT_LIFETIME)
         ):
-            trial.expected_fault_seen |= (
-                trial.state.message.state == State.FAULT
-                and trial.state.message.epoch > trial.inject_epoch
-                and trial.fault.message.mask == FEEDBACK_MISSING
-                and fresh(trial.state, self.now_ns, STATE_LIFETIME)
-                and fresh(trial.fault, self.now_ns, FAULT_LIFETIME)
-            )
+            trial.expected_fault_epoch = trial.state.message.epoch
 
     @staticmethod
     def _supply_off(flags):
@@ -241,11 +256,12 @@ class DiagnosticEngine:
                 and (run is None or run.status != RunStatus.OPEN)
             ):
                 self.idle_evidence = record_ids
-        if (
+        new_run = (
             run is not None
             and frame is not None
             and (self.trial is None or self.trial.run_id != run.run_id)
-        ):
+        )
+        if new_run:
             if self.latest_result and self.latest_result["run_id"] == run.run_id:
                 return
             if self.trial is not None:
@@ -260,6 +276,8 @@ class DiagnosticEngine:
         trial.add_evidence(*record_ids)
         for issue in (*observation.issues, *(run.issues if run else ())):
             trial.add_issue(f"UART_{issue.value}")
+        if new_run:
+            trial.baseline_accepted = not trial.issues
         if frame is None or run is None:
             return
         if frame.kind == EventType.INJECT and trial.inject_tick is None:
@@ -315,6 +333,7 @@ class DiagnosticEngine:
             return
         if event == "recording_failed":
             self.healthy_recording = False
+            self.can.samples.reset()
         if event == "can_disconnect":
             self.can.disconnect(self.now_ns)
         if event in ("fpga_disconnect", "fpga_reconnect"):

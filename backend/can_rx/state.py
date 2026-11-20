@@ -54,11 +54,11 @@ def fresh(received, now_ns, lifetime):
 
 
 class CanReceiver:
-    def __init__(self, backend_session=None):
+    def __init__(self, backend_session=None, *, samples=None):
         self.backend_session = backend_session or str(uuid4())
         self.ingest_seq = 0
         self.errors = Counter()
-        self.samples = SampleAssembler()
+        self.samples = samples if samples is not None else SampleAssembler()
         self.highest_epoch = 0
         self.required_epoch = 0
         self.highest_operator_boot = 0

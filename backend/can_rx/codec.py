@@ -146,6 +146,16 @@ class SampleTime:
     boot: int
 
 
+def message_motor_boot(message):
+    if isinstance(message, (Hello, SampleTime)):
+        return message.boot
+    if isinstance(message, (MotorState, Fault, Permit, Command)):
+        return message.epoch >> 16
+    if isinstance(message, CommandResult):
+        return message.request_epoch >> 16
+    return None
+
+
 class InvalidFrame(ValueError):
     def __init__(self, reason, sample_seq=None):
         super().__init__(reason)

@@ -6,9 +6,8 @@ from collections import Counter
 from contextlib import ExitStack
 
 from ..can_rx.codec import CanId
-from ..diagnostics.engine import DiagnosticEngine
 from ..diagnostics.inputs import Input
-from ..diagnostics.journal import Journal, record_input
+from ..diagnostics.journal import FLUSH_INTERVAL_NS, Journal, record_input
 from ..diagnostics.verdict import Config
 from ..fpga_uart.session import Issue
 from .socketcan import CAN_ERR_BUSOFF, open_can, read_external_frame
@@ -21,12 +20,19 @@ def receive_inputs(devices, readers, duration_ns):
     with selectors.DefaultSelector() as selector:
         for source, device in devices.items():
             selector.register(device, selectors.EVENT_READ, source)
-        deadline = time.monotonic_ns() + duration_ns
+        started = time.monotonic_ns()
+        deadline = started + duration_ns
+        next_clock = started + FLUSH_INTERVAL_NS
         while selector.get_map():
-            remaining = deadline - time.monotonic_ns()
-            if remaining <= 0:
+            now = time.monotonic_ns()
+            if now >= deadline:
                 break
-            for key, _ in selector.select(remaining / TIME_UNIT_NS):
+            if now >= next_clock:
+                next_clock = now + FLUSH_INTERVAL_NS
+                yield now, "service", "clock", None
+                continue
+            timeout = (min(deadline, next_clock) - now) / TIME_UNIT_NS
+            for key, _ in selector.select(timeout):
                 if time.monotonic_ns() > deadline:
                     break
                 source = key.data
@@ -55,12 +61,12 @@ def receive_inputs(devices, readers, duration_ns):
                 ):
                     selector.unregister(key.fileobj)
                     yield now, "service", "can_disconnect", "CAN bus-off"
-        # 실제 도달한 시각만 기록해 리플레이에서 관측 공백을 채우지 않는다.
-        yield time.monotonic_ns(), "service", "clock", None
+        # 저장 지연으로 마감을 넘겨도 이후 시간을 관측 근거로 쓰지 않는다.
+        yield min(time.monotonic_ns(), deadline), "service", "clock", None
 
 
 def capture(devices, readers, journal, config, duration_ns):
-    engine = DiagnosticEngine(journal.evidence_session, config)
+    engine = journal.new_engine(config)
     counts = Counter()
     errors = []
     for seq, (now, source, payload, error) in enumerate(
@@ -90,8 +96,7 @@ def capture(devices, readers, journal, config, duration_ns):
                     and Issue.SESSION_QUARANTINED not in observation.issues
                 ):
                     counts["fpga_frames"] += 1
-    for context in engine.finish():
-        journal.result(context)
+    journal.finish(engine)
 
     missing = []
     if "can" in devices and not counts["can_motor_states"]:

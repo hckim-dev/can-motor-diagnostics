@@ -9,14 +9,18 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from ..can_rx.codec import message_motor_boot
 from .engine import DiagnosticEngine
 from .inputs import Input
+from .measurements import MeasurementLog
 from .verdict import Config
 
 FORMAT_VERSION = 1
 PROTOCOL_VERSION = {"can": "2.1", "fpga_uart": "1.0"}
 UTC_ZONE = timezone(timedelta(0))
 JOURNALS = ("inputs.jsonl", "raw_can.jsonl", "raw_fpga.jsonl", "events.jsonl")
+MEASUREMENTS = ("samples.csv", "operations.jsonl")
+FLUSH_INTERVAL_NS = 1_000_000_000
 
 
 def utc_now():
@@ -122,16 +126,24 @@ class Journal:
             self.manifest["hardware"] = hardware or original["hardware"]
         self._stack = ExitStack()
         self._digest = sha256()
+        self._last_flush_ns = None
+        self._needs_finish = False
 
     def __enter__(self):
         self.directory.mkdir(parents=True, exist_ok=False)
         try:
             self.files = {
                 name: self._stack.enter_context(
-                    (self.directory / name).open("x", encoding="utf-8")
+                    (self.directory / name).open("x", encoding="utf-8", newline="")
                 )
-                for name in JOURNALS
+                for name in (*JOURNALS, *MEASUREMENTS)
             }
+            self.measurements = MeasurementLog(
+                self.files["samples.csv"],
+                self.evidence_session,
+                self.manifest["source"],
+                self.write_operation,
+            )
             return self
         except BaseException:
             self._stack.close()
@@ -145,6 +157,8 @@ class Journal:
         finally:
             self._stack.close()
         if exc_type is None:
+            if self._needs_finish:
+                raise ValueError("기록 종료 처리가 완료되지 않았습니다")
             self._publish_manifest()
 
     def _publish_manifest(self):
@@ -178,15 +192,39 @@ class Journal:
         if self.original and self._digest.hexdigest() != self.original["input_sha256"]:
             raise ValueError("원본 입력의 해시 불일치")
 
-    def project(self, row, received, engine):
+    def new_engine(self, config):
+        engine = DiagnosticEngine(
+            self.evidence_session, config, on_sample=self.measurements.completed.append
+        )
+        self._needs_finish = True
+        return engine
+
+    def flush_due(self, record):
+        now = record.rx_mono_ns
+        clock = record.source == "service" and record.payload == "clock"
+        if clock or (
+            self._last_flush_ns is not None
+            and now - self._last_flush_ns >= FLUSH_INTERVAL_NS
+        ):
+            for file in self.files.values():
+                file.flush()
+            self._last_flush_ns = now
+        elif self._last_flush_ns is None:
+            self._last_flush_ns = now
+
+    def project(self, row, received):
         if row["source"] == "can":
-            boot = (
-                engine.can.highest_epoch >> 16
-                if engine.can.motor_known(engine.now_ns)
-                else None
-            )
             self.files["raw_can.jsonl"].write(
-                json_line({**row, "motor_boot": boot, "decode_error": received.error})
+                json_line(
+                    {
+                        **row,
+                        "interface": self.manifest.get("hardware", {}).get(
+                            "can_interface"
+                        ),
+                        "motor_boot": message_motor_boot(received.message),
+                        "decode_error": received.error,
+                    }
+                )
             )
         elif row["source"] == "fpga":
             candidates = [
@@ -204,8 +242,9 @@ class Journal:
             )
 
     def result(self, context):
-        for name in JOURNALS[:-1]:
-            sync(self.files[name])
+        for name, file in self.files.items():
+            if name != "events.jsonl":
+                sync(file)
         event = {
             "event_id": str(uuid4()),
             "rx_utc": utc_now(),
@@ -217,18 +256,29 @@ class Journal:
         sync(self.files["events.jsonl"])
         return event["context"]
 
+    def write_operation(self, row):
+        self.files["operations.jsonl"].write(json_line(row))
+
+    def finish(self, engine):
+        self.measurements.finish(engine)
+        results = [self.result(context) for context in engine.finish()]
+        self._needs_finish = False
+        return results
+
 
 def record_input(journal, engine, record, *, original_utc=None, replay_ns=None):
     row = journal.input(record, original_utc, replay_ns)
     received, completed = engine.ingest(record)
-    journal.project(row, received, engine)
+    journal.project(row, received)
+    journal.measurements.project(record, row, received, engine)
+    journal.flush_due(record)
     return received, [journal.result(context) for context in completed]
 
 
 def evaluate(source, journal, config, *, pace=None):
     if journal.original:
         verify_source(source, journal.original)
-    engine = DiagnosticEngine(journal.evidence_session, config)
+    engine = journal.new_engine(config)
     results = []
     for record, original_utc in iter_inputs(
         source, journal.evidence_session, recorded=journal.original is not None
@@ -239,5 +289,5 @@ def evaluate(source, journal, config, *, pace=None):
         )
         results.extend(completed)
     journal.verify_input()
-    results.extend(journal.result(context) for context in engine.finish())
+    results.extend(journal.finish(engine))
     return results

@@ -266,6 +266,28 @@ class VerdictTest(unittest.TestCase):
             ("INCONCLUSIVE", "GAP_RECOVERY_EVIDENCE_MISSING"),
         )
 
+    def test_gap_cannot_confirm_fault_from_a_new_epoch_after_end(self):
+        rows = scenario_rows(3, recovery="missing")[:-1]
+        new_fault = status(2210, State.FAULT, epoch=EPOCH + 2, mask=4)
+        (result,) = run_engine([*rows, *new_fault, service(2500)])
+
+        self.assertEqual(
+            (result["result"], result["reason"]),
+            ("INCONCLUSIVE", "GAP_RECOVERY_EPOCH_CHANGED"),
+        )
+
+    def test_gap_orders_equal_timestamp_recovery_frames_by_ingest_sequence(self):
+        *before_end, end, clock = scenario_rows(3, recovery="missing")
+        recovery = status(2000, State.FAULT, epoch=EPOCH + 1, mask=4)[1:]
+        (after,) = run_engine([*before_end, end, *recovery, clock])
+        (before,) = run_engine([*before_end, *recovery, end, clock])
+
+        self.assertEqual(after["result"], "PASS")
+        self.assertEqual(
+            (before["result"], before["reason"]),
+            ("INCONCLUSIVE", "GAP_RECOVERY_EVIDENCE_MISSING"),
+        )
+
     def test_gap_clear_remains_failure_after_fault_relatches(self):
         rows = scenario_rows(3, recovery="missing")[:-1]
         clear = status(2110, State.STOPPED, epoch=EPOCH + 2)

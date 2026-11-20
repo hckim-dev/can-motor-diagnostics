@@ -1,5 +1,6 @@
 """실물 장치 없이 Jetson 수신 경로의 ABI와 장애 처리를 검증한다."""
 
+import csv
 import json
 import os
 import pty
@@ -137,7 +138,7 @@ class CaptureTest(unittest.TestCase):
             )
             self.assertEqual(next(records), (0, "fpga", b"data", None))
             now = 11
-            self.assertEqual(list(records), [(11, "service", "clock", None)])
+            self.assertEqual(list(records), [(10, "service", "clock", None)])
         late_reader.assert_not_called()
 
     def test_uart_session_discontinuity_fails_capture_after_a_valid_frame(self):
@@ -183,7 +184,14 @@ class CaptureTest(unittest.TestCase):
                 packet(CanId.MOTOR_HELLO, bytes.fromhex("01 00 01 00 02 01 1F 00"))
             )
             sender.send(
-                packet(CanId.MOTOR_STATE, bytes((1, 0, 1, 0, State.STOPPED, 2, 4, 0)))
+                packet(CanId.MOTOR_STATE, bytes((1, 0, 1, 0, State.RUNNING, 1, 4, 0)))
+            )
+            sender.send(packet(CanId.SPEED, bytes.fromhex("01 00 3b 00 3c 00 c2 01")))
+            sender.send(
+                packet(CanId.ELECTRIC, bytes.fromhex("01 00 fa 00 70 17 27 02"))
+            )
+            sender.send(
+                packet(CanId.SAMPLE_TIME, bytes.fromhex("01 00 0a 00 00 00 01 00"))
             )
             sender.send(packet(CAN_ERR_FLAG | CAN_ERR_BUSOFF, bytes(8)))
             output = Path(directory) / "can"
@@ -207,15 +215,32 @@ class CaptureTest(unittest.TestCase):
                 [row.get("event") for row in rows[-2:]], ["can_disconnect", "clock"]
             )
             self.assertEqual(rows[-3]["rx_mono_ns"], rows[-2]["rx_mono_ns"])
+            raw_can = [
+                json.loads(line)
+                for line in (output / "raw_can.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual({row["interface"] for row in raw_can}, {"test"})
+            operation = json.loads(
+                (output / "operations.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(operation["end_reason"], "CAN_DISCONNECT")
+            self.assertFalse(operation["end_observed"])
+            with (output / "samples.csv").open(encoding="utf-8", newline="") as file:
+                (sample,) = csv.DictReader(file)
+            self.assertEqual(sample["operation_id"], operation["operation_id"])
+            self.assertEqual(sample["actual_rpm"], "59")
             manifest, original_config = load_manifest(output)
             self.assertEqual(manifest["source"], "live")
+            replayed = Path(directory) / "replay"
             with (
                 (output / "inputs.jsonl").open() as source,
-                Journal(
-                    Path(directory) / "replay", original_config, original=manifest
-                ) as journal,
+                Journal(replayed, original_config, original=manifest) as journal,
             ):
                 self.assertEqual(evaluate(source, journal, original_config), [])
+            self.assertEqual(
+                (replayed / "raw_can.jsonl").read_bytes(),
+                (output / "raw_can.jsonl").read_bytes(),
+            )
 
     def test_uart_cli_handles_split_frame_and_restores_port(self):
         master, slave = pty.openpty()
