@@ -21,6 +21,7 @@ from .codec import (
 from .samples import (
     NS_PER_MS,
     SEQUENCE_HALF,
+    Sample,
     SampleAssembler,
     empty_sample,
     forward_delta,
@@ -51,6 +52,98 @@ class Observation:
 
 def fresh(received, now_ns, lifetime):
     return received is not None and now_ns - received.rx_mono_ns < lifetime
+
+
+def compatible_hello(hello, now_ns):
+    return fresh(hello, now_ns, HELLO_LIFETIME) and hello.message.version == VERSION
+
+
+def motor_session_known(connected, hello, required_epoch, now_ns):
+    return (
+        connected
+        and compatible_hello(hello, now_ns)
+        and hello.message.epoch >= required_epoch
+    )
+
+
+@dataclass(frozen=True)
+class CanView:
+    """송신 시각에 다시 계산할 수 있는 CAN 수신 근거다."""
+
+    connected: bool
+    highest_epoch: int
+    required_epoch: int
+    hello: Observation | None
+    operator_hello: Observation | None
+    state: Observation | None
+    fault: Observation | None
+    permit: Observation | None
+    last_state_ns: int | None
+    last_permit_ns: int | None
+    sample: Sample | None
+
+    def at(self, now_ns):
+        known = motor_session_known(
+            self.connected, self.hello, self.required_epoch, now_ns
+        )
+        state = (
+            self.state.message
+            if known and fresh(self.state, now_ns, STATE_LIFETIME)
+            else None
+        )
+        fault = (
+            self.fault.message
+            if known and fresh(self.fault, now_ns, FAULT_LIFETIME)
+            else None
+        )
+        permit = (
+            self.permit.message
+            if known
+            and fresh(self.permit, now_ns, PERMIT_LIFETIME)
+            and compatible_hello(self.operator_hello, now_ns)
+            else None
+        )
+
+        estop = (
+            bool(state.flags & NC2_OPEN)
+            if state is not None and self.hello.message.capabilities & NC2_CAPABILITY
+            else None
+        )
+        sample = self.sample if known else None
+
+        return {
+            "motor": {
+                "epoch": self.highest_epoch if known else None,
+                "state": state.state.name if state else "UNKNOWN",
+                "mode": state.mode.name if state else "UNKNOWN",
+                "fault_mask": fault.mask if fault else None,
+                "link": self.link(state, self.last_state_ns),
+                "age_ms": self.age(self.last_state_ns, now_ns),
+                "sample": sample.snapshot(now_ns) if sample else empty_sample(),
+            },
+            "operator": {
+                "link": self.link(permit, self.last_permit_ns),
+                "age_ms": self.age(self.last_permit_ns, now_ns),
+                "estop_active": estop,
+                "controls_ready": (
+                    bool(
+                        permit.flags & CONTROLS_READY
+                        and not permit.flags & STOP_REQUESTED
+                    )
+                    if permit
+                    else None
+                ),
+            },
+        }
+
+    def link(self, current, last_ns):
+        if not self.connected or last_ns is None:
+            return "offline"
+        return "fresh" if current is not None else "stale"
+
+    @staticmethod
+    def age(last_ns, now_ns):
+        return (now_ns - last_ns) // NS_PER_MS if last_ns is not None else None
 
 
 class CanReceiver:
@@ -116,21 +209,15 @@ class CanReceiver:
         return received
 
     def motor_known(self, now_ns):
-        return (
-            self.connected
-            and fresh(self.hello, now_ns, HELLO_LIFETIME)
-            and self.hello.message.version == VERSION
-            and self.hello.message.epoch >= self.required_epoch
+        return motor_session_known(
+            self.connected, self.hello, self.required_epoch, now_ns
         )
 
     def samples_allowed(self, now_ns):
         return self.motor_known(now_ns) and now_ns >= self.quarantine_until
 
     def operator_known(self, now_ns):
-        return (
-            fresh(self.operator_hello, now_ns, HELLO_LIFETIME)
-            and self.operator_hello.message.version == VERSION
-        )
+        return compatible_hello(self.operator_hello, now_ns)
 
     def accept(self, received):
         message, now_ns = received.message, received.rx_mono_ns
@@ -251,62 +338,19 @@ class CanReceiver:
 
     def snapshot(self, now_ns):
         self.advance(now_ns)
-        known = self.motor_known(now_ns)
-        state = (
-            self.state.message
-            if known and fresh(self.state, now_ns, STATE_LIFETIME)
-            else None
-        )
-        fault = (
-            self.fault.message
-            if known and fresh(self.fault, now_ns, FAULT_LIFETIME)
-            else None
-        )
-        permit = (
-            self.permit.message
-            if known
-            and fresh(self.permit, now_ns, PERMIT_LIFETIME)
-            and self.operator_known(now_ns)
-            else None
-        )
+        return self.capture_view().at(now_ns)
 
-        estop = (
-            bool(state.flags & NC2_OPEN)
-            if state is not None and self.hello.message.capabilities & NC2_CAPABILITY
-            else None
+    def capture_view(self):
+        return CanView(
+            connected=self.connected,
+            highest_epoch=self.highest_epoch,
+            required_epoch=self.required_epoch,
+            hello=self.hello,
+            operator_hello=self.operator_hello,
+            state=self.state,
+            fault=self.fault,
+            permit=self.permit,
+            last_state_ns=self.last_state_ns,
+            last_permit_ns=self.last_permit_ns,
+            sample=self.samples.latest,
         )
-        sample = self.samples.latest if known else None
-
-        return {
-            "motor": {
-                "epoch": self.highest_epoch if known else None,
-                "state": state.state.name if state else "UNKNOWN",
-                "mode": state.mode.name if state else "UNKNOWN",
-                "fault_mask": fault.mask if fault else None,
-                "link": self.link(state, self.last_state_ns),
-                "age_ms": self.age(self.last_state_ns, now_ns),
-                "sample": sample.snapshot(now_ns) if sample else empty_sample(),
-            },
-            "operator": {
-                "link": self.link(permit, self.last_permit_ns),
-                "age_ms": self.age(self.last_permit_ns, now_ns),
-                "estop_active": estop,
-                "controls_ready": (
-                    bool(
-                        permit.flags & CONTROLS_READY
-                        and not permit.flags & STOP_REQUESTED
-                    )
-                    if permit
-                    else None
-                ),
-            },
-        }
-
-    def link(self, current, last_ns):
-        if not self.connected or last_ns is None:
-            return "offline"
-        return "fresh" if current is not None else "stale"
-
-    @staticmethod
-    def age(last_ns, now_ns):
-        return (now_ns - last_ns) // NS_PER_MS if last_ns is not None else None

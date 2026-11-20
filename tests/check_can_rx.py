@@ -11,7 +11,8 @@ from backend.can_rx.codec import CanId, Frame, InvalidFrame, decode_frame
 from backend.can_rx.fixture import feed_frames, load_frames
 from backend.can_rx.samples import NS_PER_MS
 from backend.can_rx.state import CanReceiver
-from backend.tcp_mock import TcpMock, wait_for_stop
+from backend.tcp_mock import TcpMock
+from backend.tcp_stream import wait_for_stop
 
 FIXTURES = Path(__file__).with_name("fixtures")
 EPOCH = 0x00010001

@@ -24,7 +24,7 @@ python3 tests/check_tcp_mock.py
 
 모의 명령 순번 `cmd_seq`는 성공한 새 요청에만 발급합니다. 목업의 고정 epoch 안에서는 재접속해도 순번이 이어집니다.
 
-`tcp_mock.py`는 TCP 연결, 메시지 경계, 응답 전송을 담당합니다. `tcp_mock_control.py`는 heartbeat 만료, 시험 준비 상태, 중복 요청을 처리합니다.
+`tcp_stream.py`는 TCP 연결, 메시지 경계, 응답 전송을 담당합니다. `tcp_mock.py`는 이 공통 경로에 목업의 상태와 예제 입력을 연결하고, `tcp_mock_control.py`는 heartbeat 만료, 시험 준비 상태, 중복 요청을 처리합니다.
 
 `python3 -X dev -W error tests/check_tcp_control.py -v`로 별도 서버를 임시 포트에 띄워 정상 조작, 만료, 재접속, 잘못된 입력을 검증할 수 있습니다.
 
@@ -88,6 +88,23 @@ python3 -X dev -W error -m unittest discover -s tests -p 'check_diagnostics.py' 
 `raw_can.jsonl`의 `motor_boot`는 프레임에서 읽은 부팅 번호입니다. 부팅 번호나 모터 epoch가 없는 프레임은 `null`이며, 결합된 측정값의 부팅 번호와 원본 프레임 목록은 `samples.csv`에서 확인합니다.
 
 수집 중 버퍼를 주기적으로 비우고, 판정 증거 및 기록 완료 시 파일을 동기화합니다. 저장에 실패하면 오류를 보고하고 완료 `manifest.json`을 게시하지 않습니다.
+
+## TCP 통합 관측 서비스
+
+`backend.monitor`는 CAN·FPGA UART 입력을 하나의 순서로 처리해 기록하고, 같은 상태와 시험 판정을 TCP로 보냅니다. Jetson과 장치가 연결되지 않은 환경에서는 진단 예제로 실행할 수 있습니다.
+
+```sh
+python3 -m backend.monitor .local/monitor-run \
+  --fixture tests/fixtures/diagnostic-no-edge.jsonl --gpio-verified
+```
+
+클라이언트는 기본 `127.0.0.1:5000`에서 `hello → snapshot`을 받고 약 10Hz로 상태를 수신합니다. 판정을 디스크에 저장한 뒤 `event`를 보내며, TCP `event_id`로 `events.jsonl`의 전체 증거를 찾을 수 있습니다. 재접속하면 새 스트림에서 최근 상태와 판정을 받습니다. 명령 요청은 `READ_ONLY`로 응답합니다.
+
+저장이 지연되어도 각 TCP 송신 시점의 상태·허가·측정값 유효 기간을 적용합니다.
+
+예제는 원본 시각 간격을 따라 입력을 공급하며, 끝까지 처리한 뒤에도 TCP 관측을 유지합니다. 장치가 단절되면 해당 입력을 `OFFLINE`으로 표시하고 다른 입력과 TCP 관측을 계속합니다. 실물 장치의 재등록은 서비스를 다시 시작해 진행합니다. Ctrl+C 또는 SIGTERM으로 종료하면 관측한 입력까지만 마감하고, 정상적으로 동기화한 뒤 `manifest.json`을 게시합니다.
+
+장비를 연결한 환경에서는 `--can "$CAN_IFACE" --uart "$FPGA_TTY"`로 수신 전용 관측을 실행할 수 있습니다. 실물 수신에서 시험은 기능 관측으로 기록합니다. 이 서비스의 자체 CAN 송신은 없습니다. 장치 준비 방법은 아래 절을 참조합니다.
 
 ## Jetson 실물 연결 확인
 

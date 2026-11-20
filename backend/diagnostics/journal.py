@@ -109,6 +109,7 @@ class Journal:
             original["evidence_session"] if original else self.backend_session
         )
         self.original = original
+        self.on_event = None
         self.manifest = {
             "format_version": FORMAT_VERSION,
             "backend_version": f"diagnostics/{FORMAT_VERSION}",
@@ -206,11 +207,14 @@ class Journal:
             self._last_flush_ns is not None
             and now - self._last_flush_ns >= FLUSH_INTERVAL_NS
         ):
-            for file in self.files.values():
-                file.flush()
+            self.flush()
             self._last_flush_ns = now
         elif self._last_flush_ns is None:
             self._last_flush_ns = now
+
+    def flush(self):
+        for file in self.files.values():
+            file.flush()
 
     def project(self, row, received):
         if row["source"] == "can":
@@ -254,6 +258,8 @@ class Journal:
         }
         self.files["events.jsonl"].write(json_line(event))
         sync(self.files["events.jsonl"])
+        if self.on_event is not None:
+            self.on_event(event)
         return event["context"]
 
     def write_operation(self, row):
@@ -262,6 +268,7 @@ class Journal:
     def finish(self, engine):
         self.measurements.finish(engine)
         results = [self.result(context) for context in engine.finish()]
+        self.flush()
         self._needs_finish = False
         return results
 

@@ -11,8 +11,9 @@ from .can_control.controller import CanController, Outcome
 from .can_control.mock_motor import MemoryCan, MockMotor
 from .can_control.wire import Opcode
 from .can_rx.codec import Mode
-from .tcp_mock import PORT, TcpMock, run_tcp_server
+from .tcp_mock import TcpMock
 from .tcp_mock_control import REQUEST_LIMIT, RequestRecord, request_payload
+from .tcp_stream import PORT, run_tcp_server
 
 POLL_INTERVAL = 0.01
 DEFAULT_BOOT_ID_PATH = Path(".local/can-mock-boot-id")
