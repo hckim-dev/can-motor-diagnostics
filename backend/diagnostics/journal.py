@@ -104,8 +104,15 @@ def verify_results(directory: Path, results):
         raise ValueError("리플레이 판정이 원본 결과와 일치하지 않는다")
 
 
-def verify_source(source, manifest):
+def canonical_input_bytes(record, rx_utc):
+    return json_line(original_row(record, rx_utc)).encode("utf-8")
+
+
+def verify_source(source, manifest, *, block_size=None):
     digest = sha256()
+    block = sha256()
+    block_digests = []
+    pending = 0
     last_ns = 0
     for record, rx_utc in iter_inputs(
         source, manifest["evidence_session"], recorded=True
@@ -113,11 +120,35 @@ def verify_source(source, manifest):
         if record.rx_mono_ns < last_ns:
             raise ValueError("원본 기록 시각이 역행한다")
         last_ns = record.rx_mono_ns
-        digest.update(json_line(original_row(record, rx_utc)).encode("utf-8"))
+        row = canonical_input_bytes(record, rx_utc)
+        digest.update(row)
+        if block_size is not None:
+            block.update(row)
+            pending += 1
+            if pending == block_size:
+                block_digests.append(block.digest())
+                block, pending = sha256(), 0
     if digest.hexdigest() != manifest["input_sha256"]:
         raise ValueError("원본 입력의 해시 불일치")
     if not isinstance(source, RecordedLog):
         source.seek(0)
+    if pending:
+        block_digests.append(block.digest())
+    return block_digests
+
+
+def engine_for_recording(manifest, config, *, on_sample=None):
+    return DiagnosticEngine(
+        manifest["evidence_session"],
+        config,
+        on_sample=on_sample,
+        fpga_status_watchdog=manifest.get("hardware", {}).get("fpga_status_watchdog")
+        is True,
+        # 이전 기록은 저장 당시의 판정 근거 목록을 유지한다.
+        link_low_space_evidence=(
+            manifest.get("recording_policy_version") == RECORDING_POLICY_VERSION
+        ),
+    )
 
 
 class Journal:
@@ -292,20 +323,10 @@ class Journal:
             raise ValueError("원본 입력의 해시 불일치")
 
     def new_engine(self, config):
-        hardware = self.manifest.get("hardware", {})
-        engine = DiagnosticEngine(
-            self.evidence_session,
-            config,
-            on_sample=self.measurements.completed.append,
-            fpga_status_watchdog=hardware.get("fpga_status_watchdog") is True,
-            link_low_space_evidence=(
-                # 이전 기록은 저장 당시의 판정 근거 목록을 유지한다.
-                self.manifest.get("recording_policy_version")
-                == RECORDING_POLICY_VERSION
-            ),
-        )
         self._needs_finish = True
-        return engine
+        return engine_for_recording(
+            self.manifest, config, on_sample=self.measurements.completed.append
+        )
 
     def flush_due(self, record):
         now = record.rx_mono_ns

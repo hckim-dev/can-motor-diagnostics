@@ -17,6 +17,7 @@ from ..hardware.uart import open_uart, read_uart
 from ..tcp_stream import PORT, listen, shutdown_signal
 from .control import ControlFeed
 from .inputs import DeviceFeed, FixtureFeed
+from .replay import serve_replay
 from .service import Monitor
 
 
@@ -33,7 +34,8 @@ async def serve(journal, config, feed, host, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("output", type=Path, help="새 기록 디렉터리")
+    parser.add_argument("output", nargs="?", type=Path, help="새 기록 디렉터리")
+    parser.add_argument("--replay", type=Path, help="읽기 전용으로 재생할 완료 기록")
     parser.add_argument("--fixture", type=Path, help="시간순 모의 진단 입력 JSONL")
     parser.add_argument("--can", help="SocketCAN 수신 인터페이스")
     parser.add_argument("--uart", type=Path, help="FPGA 전용 tty 경로")
@@ -44,12 +46,25 @@ def main():
     parser.add_argument(
         "--gpio-verified", action="store_true", help="모의 GPIO 검증 전제"
     )
-    parser.add_argument("--gpio-limit-us", type=positive, default=GPIO_LIMIT_US)
+    parser.add_argument("--gpio-limit-us", type=positive)
     add_metadata_arguments(parser)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()
-    if bool(args.fixture) == bool(args.can or args.uart):
+    if args.replay is None and args.output is None:
+        parser.error("기록 출력 디렉터리를 지정해야 합니다")
+    if args.replay is not None and (
+        args.output is not None
+        or args.fixture
+        or args.can
+        or args.uart
+        or args.motor_power_off
+        or args.boot_id_file
+        or args.gpio_verified
+        or args.gpio_limit_us is not None
+    ):
+        parser.error("--replay는 기록·장치·시험 설정 옵션과 함께 쓸 수 없습니다")
+    if args.replay is None and bool(args.fixture) == bool(args.can or args.uart):
         parser.error(
             "--fixture 또는 --can/--uart 중 한 가지 입력 방식을 지정해야 합니다"
         )
@@ -66,12 +81,21 @@ def main():
         parser.error("--boot-id-file에는 --motor-power-off가 필요합니다")
 
     try:
+        metadata = recording_metadata(args)
+        if args.replay is not None:
+            if any(
+                value is not None
+                for group in metadata.values()
+                for value in group.values()
+            ):
+                parser.error("--replay는 원본의 펌웨어 빌드와 설정을 사용합니다")
+            serve_replay(args.replay, args.host, args.port)
+            return
         config = Config(
             gpio_verified=args.gpio_verified,
             functional_only=not args.fixture,
-            gpio_limit_us=args.gpio_limit_us,
+            gpio_limit_us=args.gpio_limit_us or GPIO_LIMIT_US,
         )
-        metadata = recording_metadata(args)
         with ExitStack() as stack:
             hardware = None
             if args.fixture:

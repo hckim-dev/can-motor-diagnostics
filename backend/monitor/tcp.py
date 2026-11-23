@@ -3,13 +3,17 @@
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..can_rx.state import STATE_LIFETIME, CanView
 from ..fpga_uart.session import STATUS_LIFETIME_NS
 from ..tcp_stream import TcpStream
 
 EVENT_LIMIT = 32
+
+
+def snapshot_links(snapshot):
+    return {name: snapshot[name]["link"] for name in ("motor", "operator")}
 
 
 @dataclass(frozen=True)
@@ -22,8 +26,9 @@ class MonitorView:
     fpga_degraded: bool
     fpga_last_ns: int | None
     healthy_recording: bool
+    service_details: dict = field(default_factory=dict)
 
-    def at(self, wall_ns):
+    def at(self, wall_ns, *, age_logging=True):
         elapsed_ns = wall_ns - self.wall_ns
         now_ns = self.logical_ns + elapsed_ns
         view = self.can.at(now_ns)
@@ -47,7 +52,8 @@ class MonitorView:
                 "fpga": fpga,
                 "log": (
                     "OK"
-                    if self.healthy_recording and elapsed_ns < STATE_LIFETIME
+                    if self.healthy_recording
+                    and (not age_logging or elapsed_ns < STATE_LIFETIME)
                     else "DEGRADED"
                 ),
                 "ai": "DISABLED",
@@ -92,6 +98,8 @@ class MonitorStream(TcpStream):
         self.latest = initial
         self.events = deque()
         self.recording = None
+        self.reported_services = {}
+        self.reported_links = None
 
     def open_session(self, stream_id):
         if self.control is not None:
@@ -107,7 +115,10 @@ class MonitorStream(TcpStream):
             self.control.drain()
 
     def snapshot(self, session, now):
-        snapshot = self.latest.at(time.monotonic_ns())
+        return self._snapshot_at(time.monotonic_ns())
+
+    def _snapshot_at(self, wall_ns, *, age_logging=True):
+        snapshot = self.latest.at(wall_ns, age_logging=age_logging)
         if self.recording is not None:
             snapshot["recording"] = self.recording
         return snapshot
@@ -122,8 +133,62 @@ class MonitorStream(TcpStream):
         self.events.extend(events)
 
     def notifications(self):
-        while self.events:
+        for _ in range(len(self.events)):
             yield "event", self.events.popleft()
+
+    def snapshot_notifications(self, snapshot):
+        messages = []
+        links = snapshot_links(snapshot)
+        if self.reported_links is not None:
+            for name, link in links.items():
+                previous = self.reported_links[name]
+                if link != previous:
+                    messages.append(
+                        (
+                            "event",
+                            {
+                                "event_id": str(uuid.uuid4()),
+                                "category": "link",
+                                "code": "LINK_CHANGED",
+                                "severity": "info" if link == "fresh" else "warning",
+                                "context": {
+                                    "link": name,
+                                    "previous": previous,
+                                    "current": link,
+                                },
+                            },
+                        )
+                    )
+        self.reported_links = links
+
+        service_details = self.latest.service_details
+        recording = snapshot.get("recording")
+        for name, status in snapshot["services"].items():
+            details = service_details.get(name, {})
+            reason = details.get("reason")
+            dropped = details.get("dropped", 0)
+            if name == "log" and recording is not None:
+                reason = recording["reason"]
+                dropped = recording.get("dropped_records", 0)
+            elif name == "log" and status == "DEGRADED":
+                reason = (
+                    "RECORDING_DELAY"
+                    if self.latest.healthy_recording
+                    else "RECORDING_FAILED"
+                )
+            service = {
+                "name": name,
+                "status": status,
+                "reason": None if status == "OK" else reason,
+                "retries": details.get("retries", 0),
+                "dropped": dropped,
+            }
+            if service != self.reported_services.get(name):
+                self.reported_services[name] = service
+                messages.append(("service", service))
+        return messages
 
     def stream_closed(self):
         self.events.clear()
+        self.reported_services.clear()
+        self.reported_links = None

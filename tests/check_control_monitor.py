@@ -17,6 +17,7 @@ from check_fpga_recovery import open_pty, raw
 from check_live_can_control import DatagramCan
 from check_monitor import (
     connected,
+    is_test_event,
     observe,
     read_frame,
     rows_in,
@@ -520,9 +521,7 @@ class ControlMonitorTest(unittest.IsolatedAsyncioTestCase):
                                     + raw(uart(3000, 3, 5, 3, scenario=1))
                                 )
 
-                            event = await observe(
-                                rx, lambda msg: msg["type"] == "event"
-                            )
+                            event = await observe(rx, is_test_event)
                             context = event["data"]["context"]
                             self.assertEqual(event["stream_id"], stream)
                             self.assertEqual(

@@ -2,13 +2,13 @@
 
 import asyncio
 import logging
-import time
 
 from ..diagnostics.inputs import Input
 from ..diagnostics.journal import record_input
 from ..diagnostics.storage import RecordingFailure
 from ..tcp_stream import SNAPSHOT_INTERVAL
-from .tcp import MonitorStream, MonitorView
+from .presentation import MonitorPresentation, verdict_event
+from .tcp import MonitorStream
 
 LOGGER = logging.getLogger(__name__)
 
@@ -19,8 +19,7 @@ class Monitor:
         self.engine = journal.new_engine(config)
         self.feed = feed
         self.observe_devices = getattr(feed, "observe_devices", None)
-        self.fpga_last_ns = None
-        self.fpga_degraded = False
+        self.presentation = MonitorPresentation()
         self.events = []
         self.journal.on_event = self._remember_event
         self.finished = False
@@ -34,58 +33,10 @@ class Monitor:
             attach(self.stream)
 
     def _remember_event(self, event):
-        context = event["context"]
-        # 전체 증거 목록은 디스크에 보존하고 TCP에는 event_id와 판정 요약을 보낸다.
-        self.events.append(
-            {
-                "event_id": event["event_id"],
-                "category": event["category"],
-                "code": event["code"],
-                "severity": {"FAIL": "error", "INCONCLUSIVE": "warning"}.get(
-                    event["code"], "info"
-                ),
-                "context": {
-                    key: context[key]
-                    for key in (
-                        "run_id",
-                        "scenario_id",
-                        "result",
-                        "reason",
-                        "timing_source",
-                        "latency_us",
-                        "limit_us",
-                        "evidence_saved",
-                    )
-                },
-            }
-        )
+        self.events.append(verdict_event(event))
 
     def _view(self):
-        wall_ns = time.monotonic_ns()
-        result = self.engine.snapshot()
-        uart = self.engine.uart
-        return MonitorView(
-            can=self.engine.can.capture_view(),
-            logical_ns=max(self.engine.now_ns, self.feed.now_ns()),
-            wall_ns=wall_ns,
-            test={
-                "run_id": result.get("run_id"),
-                "scenario_id": result.get("scenario_id"),
-                "status": result["result"],
-                "reason": result.get("reason"),
-            },
-            fpga_connected=uart.connected,
-            fpga_degraded=self.fpga_degraded or uart.quarantined,
-            fpga_last_ns=(
-                self.engine.fpga_status_ns
-                if self.engine.fpga_status_watchdog
-                else self.fpga_last_ns
-            ),
-            healthy_recording=(
-                self.engine.healthy_recording
-                and self.engine.low_space_record_id is None
-            ),
-        )
+        return self.presentation.view(self.engine, self.feed.now_ns())
 
     def _consume(self, batch):
         self._consume_records(batch)
@@ -116,15 +67,8 @@ class Monitor:
         for record in self._batch_inputs(batch):
             self.unattempted_records -= 1
             received, _ = record_input(self.journal, self.engine, record)
-            if record.source == "fpga":
-                for observation in received:
-                    if observation.frame is not None and not observation.duplicate:
-                        self.fpga_last_ns = record.rx_mono_ns
-                    if not observation.duplicate:
-                        self.fpga_degraded = bool(observation.issues)
-            elif record.source == "service" and record.payload == "fpga_reconnect":
-                self.fpga_last_ns = None
-                self.fpga_degraded = False
+            if event := self.presentation.observe(self.engine, record, received):
+                self.events.append(event)
 
     def _save_remaining_inputs(self, batch):
         # 수집 장애로 중단된 기록에는 판정을 추가하지 않는다.

@@ -37,6 +37,7 @@ from backend.hardware.socketcan import (
 from backend.hardware.uart import open_uart, read_uart
 from backend.monitor.inputs import DeviceFeed, FixtureFeed
 from backend.monitor.service import Monitor
+from backend.monitor.tcp import MonitorStream
 from backend.tcp_stream import MAX_LINE_BYTES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +76,10 @@ async def snapshot_where(reader, predicate):
     return message["data"]
 
 
+def is_test_event(message):
+    return message["type"] == "event" and message["data"]["category"] == "test"
+
+
 @asynccontextmanager
 async def connected(port):
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -104,6 +109,17 @@ async def running(monitor):
 
 
 class SnapshotFreshnessTest(unittest.TestCase):
+    def test_notification_drain_leaves_new_events_for_next_snapshot(self):
+        stream = MonitorStream(str(uuid.uuid4()), "mock", None)
+        original = {"code": "FIRST"}
+        later = {"code": "LATER"}
+        stream.events.append(original)
+        pending = stream.notifications()
+        self.assertEqual(next(pending), ("event", original))
+        stream.events.append(later)
+        self.assertEqual(list(pending), [])
+        self.assertEqual(list(stream.notifications()), [("event", later)])
+
     def test_tcp_ages_each_can_field_while_worker_has_no_new_publication(self):
         now_ns = 190 * MS
         config = Config()
@@ -190,6 +206,16 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         monitor.stream.recording["reason"], "RECORDING_SPACE_LOW"
                     )
+                    snapshot = monitor.stream.snapshot(None, None)
+                    notices = {
+                        data["name"]: data
+                        for kind, data in monitor.stream.snapshot_notifications(
+                            snapshot
+                        )
+                        if kind == "service"
+                    }
+                    self.assertEqual(notices["log"]["status"], "DEGRADED")
+                    self.assertEqual(notices["log"]["reason"], "RECORDING_SPACE_LOW")
                     await monitor._publish_from(monitor._finish, batch[5:])
                     self.assertIsNone(monitor.stream.recording)
 
@@ -268,6 +294,12 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(hello_msg["source"], "mock")
                     self.assertEqual((await read_frame(reader))["type"], "snapshot")
+                    services = [await read_frame(reader) for _ in range(4)]
+                    self.assertTrue(all(msg["type"] == "service" for msg in services))
+                    self.assertEqual(
+                        {msg["data"]["name"] for msg in services},
+                        {"can", "fpga", "log", "ai"},
+                    )
                     writer.write(
                         (
                             json.dumps(
@@ -298,7 +330,16 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                         ),
                     )
                     run_id = running_view["test"]["run_id"]
-                    event = await observe(reader, lambda msg: msg["type"] == "event")
+                    fault = await observe(
+                        reader,
+                        lambda msg: (
+                            msg["type"] == "event"
+                            and msg["data"]["code"] == "MOTOR_FAULT_CHANGED"
+                        ),
+                    )
+                    self.assertEqual(fault["data"]["category"], "fault")
+                    self.assertEqual(fault["data"]["context"]["fault_mask"], 4)
+                    event = await observe(reader, is_test_event)
                     self.assertEqual(event["data"]["code"], "PASS")
                     self.assertEqual(event["data"]["context"]["run_id"], run_id)
                     self.assertTrue(event["data"]["context"]["evidence_saved"])
@@ -306,6 +347,14 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                         reader, lambda snap: snap["motor"]["link"] == "stale"
                     )
                     self.assertEqual(stale["motor"]["state"], "UNKNOWN")
+                    link = await observe(
+                        reader,
+                        lambda msg: (
+                            msg["type"] == "event"
+                            and msg["data"]["code"] == "CAN_DISCONNECT"
+                        ),
+                    )
+                    self.assertEqual(link["data"]["category"], "link")
                     offline = await snapshot_where(
                         reader,
                         lambda snap: (
@@ -326,7 +375,9 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         (await read_frame(reader))["data"]["test"]["run_id"], run_id
                     )
-                    self.assertEqual((await read_frame(reader))["type"], "snapshot")
+                    await snapshot_where(
+                        reader, lambda snap: snap["test"]["run_id"] == run_id
+                    )
                     process.send_signal(signal.SIGTERM)
                     stopping = True
                     await asyncio.wait_for(reader.read(), 5)
@@ -411,7 +462,7 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                 sender.send(
                     CAN_FRAME.pack(CAN_ERR_FLAG | CAN_ERR_BUSOFF, 8, 0, bytes(8))
                 )
-                event = await observe(reader, lambda msg: msg["type"] == "event")
+                event = await observe(reader, is_test_event)
                 self.assertEqual(event["data"]["context"]["reason"], "CAN_DISCONNECT")
                 await snapshot_where(
                     reader, lambda snap: snap["services"]["can"] == "OFFLINE"
@@ -465,7 +516,9 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                             self.assertTrue(await asyncio.to_thread(writing.wait, 2))
                             while True:
                                 message = await read_frame(reader, timeout=2)
-                                self.assertEqual(message["type"], "snapshot")
+                                self.assertFalse(is_test_event(message))
+                                if message["type"] != "snapshot":
+                                    continue
                                 if message["data"]["services"]["log"] == "DEGRADED":
                                     self.assertEqual(
                                         message["data"]["motor"]["state"], "UNKNOWN"
@@ -476,9 +529,7 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                                     break
                         finally:
                             release.set()
-                        event = await observe(
-                            reader, lambda msg: msg["type"] == "event"
-                        )
+                        event = await observe(reader, is_test_event)
                         self.assertEqual(event["data"]["code"], "ABORTED")
                         self.assertTrue(event["data"]["context"]["evidence_saved"])
 

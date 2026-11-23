@@ -45,6 +45,7 @@ def decode_control_message(line):
 class TcpStream:
     source = "mock"
     capabilities = ()
+    replay_of = None
 
     def __init__(self, backend_session=None):
         self.backend_session = backend_session or str(uuid.uuid4())
@@ -60,6 +61,12 @@ class TcpStream:
 
     def notifications(self):
         return ()
+
+    def snapshot_notifications(self, snapshot):
+        return ()
+
+    def stream_started(self):
+        pass
 
     def stream_closed(self):
         pass
@@ -120,7 +127,7 @@ class TcpStream:
                 {
                     "backend_session": self.backend_session,
                     "protocol": CAN_PROTOCOL,
-                    "replay_of": None,
+                    "replay_of": self.replay_of,
                     "capabilities": self.capabilities,
                 },
             )
@@ -139,7 +146,12 @@ class TcpStream:
     async def stream_snapshots(self, reader, send, session):
         read = reader.readline if session else lambda: reader.read(1)
         loop = asyncio.get_running_loop()
-        await send("snapshot", self.snapshot(session, loop.time()))
+        snapshot = self.snapshot(session, loop.time())
+        notifications = self.snapshot_notifications(snapshot)
+        await send("snapshot", snapshot)
+        for kind, data in notifications:
+            await send(kind, data)
+        self.stream_started()
         next_snapshot = loop.time() + SNAPSHOT_INTERVAL
         read_task = asyncio.create_task(read())
 
@@ -180,7 +192,11 @@ class TcpStream:
                             await send("control_result", result)
                     for kind, data in self.notifications():
                         await send(kind, data)
-                    await send("snapshot", self.snapshot(session, now))
+                    now = loop.time()
+                    snapshot = self.snapshot(session, now)
+                    for kind, data in self.snapshot_notifications(snapshot):
+                        await send(kind, data)
+                    await send("snapshot", snapshot)
                     next_snapshot = now + SNAPSHOT_INTERVAL
         finally:
             read_task.cancel()

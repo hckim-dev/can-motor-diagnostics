@@ -12,6 +12,12 @@
 
 서버는 연결 직후 `hello`(`stream_seq=0`), 현재 `snapshot` 순으로 보내고 이후 10Hz로 스냅샷을 보냅니다. `hello`에는 현재 `stream_id`와 `hello.data.protocol` 값 `"2.1"`이 들어갑니다. Qt는 현재 `stream_id`로 `control_heartbeat`와 `control_request`를 보냅니다. 요청은 `request_id`로 식별하며 서버는 `control_result`로 처리 결과를 반환합니다. Qt는 처리 결과와 실제 MCU 상태 스냅샷을 각각 표시합니다. 응답 유실 시 구동 명령을 자동 재시도하지 않습니다.
 
+통합 모니터는 첫 스냅샷 뒤 CAN·FPGA·기록·AI의 `service` 메시지를 보내며, 이후 변경된 항목을 보냅니다. `data`에는 `name`, `status`, `reason`(없으면 `null`), `retries`, `dropped`가 들어갑니다. `retries`는 마지막으로 기록된 재시도 차수이고 `dropped`는 확인된 누적 손실입니다.
+
+`event.data`에는 `event_id`, `category`, `code`, `severity`, `context`가 들어갑니다. 시험 판정은 `category=test`로 구분합니다. MCU가 보고한 고장 마스크 변경은 `fault/MOTOR_FAULT_CHANGED`로, 장치 단절·재연결·재시도와 CAN 수신 큐 손실은 `link`로 전달합니다. 원본에서 파생된 이벤트는 `context.record_id`를 포함합니다. 송신 시점에 관측한 motor·operator 링크 변화는 `link/LINK_CHANGED`로 보내며, 상태 만료를 고장 해제로 표시하지 않습니다.
+
+TCP 리플레이의 `source`는 `replay`이며 `hello.data.replay_of`는 읽고 있는 기록의 `backend_session`입니다. 제어 요청에는 `READ_ONLY`를 반환합니다. 시험 이벤트는 원본과 비교한 뒤 원본 `event_id`를 유지해 보냅니다.
+
 ### backend와 모터 STM32
 
 backend가 `OP_HELLO`(`0x701`), `OP_PERMIT`(`0x080`), `COMMAND`(`0x100`)를 전송합니다. 양측 HELLO 버전은 `2.1`이며 `2.0`에는 운전 허가를 부여하지 않습니다. `OP_PERMIT`의 b0은 제어 준비, b2는 출력 억제 요청이며 기본 구성의 b1·b3·b4는 0입니다. NC2는 `MOTOR_HELLO.capabilities` b4와 `MOTOR_STATE.status_flags` b7을 통해 보고합니다.
