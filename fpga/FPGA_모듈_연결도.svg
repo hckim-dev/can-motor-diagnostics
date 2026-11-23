@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1230" viewBox="0 0 1600 1230" role="img" aria-labelledby="title desc">
+  <title id="title">CAN DO FPGA RTL 모듈 연결도</title>
+  <desc id="desc">Basys3 입력에서 엔코더 출력 및 Jetson USB UART까지 FND를 포함한 10개 RTL 모듈, 신호 방향, 공통망과 응답 배선을 표시한다.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#14544b"/>
+    </marker>
+    <marker id="return" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#873b26"/>
+    </marker>
+  </defs>
+  <style>
+    text { font: 17px 'Malgun Gothic', 'Noto Sans KR', sans-serif; fill: #182c33; }
+    .title { font-size: 30px; font-weight: 700; }
+    .section { font-size: 20px; font-weight: 700; }
+    .module { font: 700 19px Consolas, 'Liberation Mono', monospace; }
+    .signal { font: 16px Consolas, 'Liberation Mono', monospace; fill: #14544b; }
+    .return { fill: #873b26; }
+    .note { font-size: 16px; fill: #455c65; }
+    .wire { stroke: #14544b; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    .back { stroke: #873b26; marker-end: url(#return); }
+  </style>
+  <rect x="0" y="0" width="1600" height="1230" rx="0" fill="#ffffff" stroke="none"/>
+  <text x="37" y="46" class="title">CAN DO FPGA RTL 모듈 연결도</text>
+  <text x="39" y="73" class="signal">can_do_fpga_top  /  Basys3 100 MHz</text>
+  <rect x="32" y="92" width="1536" height="394" rx="8" fill="#f4f8fa" stroke="#a8bbc1"/>
+  <rect x="32" y="504" width="1536" height="344" rx="8" fill="#f4f8fa" stroke="#a8bbc1"/>
+  <text x="51" y="122" class="section">보드 입력 · 시험 제어 · A/B 출력 · 응답 계측</text>
+  <text x="51" y="536" class="section">이벤트 보존 · 프레임 조립 · USB-UART</text>
+  <rect x="230" y="151" width="246" height="117" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="245" y="180" class="module">input_conditioner</text>
+  <text x="245" y="205" class="note">버튼·GPIO 입력 처리</text>
+  <text x="245" y="231" class="signal">OUT [GPIO], [RST]</text>
+  <rect x="675" y="147" width="255" height="122" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="690" y="176" class="module">scenario_ctrl</text>
+  <text x="690" y="201" class="note">시험 상태·파형 명령</text>
+  <text x="690" y="227" class="signal">IN [TICK_US], [OVERFLOW]</text>
+  <text x="690" y="247" class="signal">OUT [RUN], [ABORT]</text>
+  <rect x="1134" y="147" width="200" height="122" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="1149" y="176" class="module">encoder_ab</text>
+  <text x="1149" y="201" class="note">정상 A/B·고정·복귀</text>
+  <text x="1149" y="248" class="signal">IN [TICK_CE]</text>
+  <rect x="230" y="342" width="246" height="117" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="245" y="371" class="module">timebase</text>
+  <text x="245" y="396" class="note">1 µs 기준과 u32 시간</text>
+  <text x="245" y="422" class="signal">OUT [TICK_CE], [TICK_US]</text>
+  <rect x="675" y="367" width="255" height="112" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="690" y="396" class="module">diag_capture</text>
+  <text x="690" y="421" class="note">t0·첫 DIAG 상승·응답 지연</text>
+  <text x="690" y="447" class="signal">IN [GPIO], [TICK_US]</text>
+  <text x="690" y="467" class="signal">OUT [CAPTURE]</text>
+  <path d="M55 229 L230 229" class="wire"/>
+  <text x="63" y="153" class="signal">btn_start, btn_rst</text>
+  <text x="63" y="171" class="signal">sw[1:0]</text>
+  <text x="63" y="189" class="signal">test_ready</text>
+  <text x="63" y="207" class="signal">diag_fault</text>
+  <path d="M476 222 L675 222" class="wire"/>
+  <text x="575" y="153" class="signal" text-anchor="middle">scenario_sel[1:0]</text>
+  <text x="575" y="171" class="signal" text-anchor="middle">start_pulse, ready</text>
+  <text x="575" y="189" class="signal" text-anchor="middle">ready_fall</text>
+  <text x="575" y="207" class="signal" text-anchor="middle">diag, diag_rise</text>
+  <path d="M930 222 L1134 222" class="wire"/>
+  <text x="1032" y="211" class="signal" text-anchor="middle">wave_cmd</text>
+  <path d="M1334 222 L1534 222" class="wire"/>
+  <text x="1434" y="209" class="signal" text-anchor="middle">enc_a, enc_b</text>
+  <text x="1434" y="248" class="note" text-anchor="middle">74HC157 → STM32 TIM4</text>
+  <path d="M930 252 L1103 252 L1103 411 L930 411" class="wire"/>
+  <text x="978" y="334" class="signal" text-anchor="middle">start_evt, inject_evt</text>
+  <text x="978" y="353" class="signal" text-anchor="middle">phase, scenario</text>
+  <path d="M788 367 L788 269" class="wire back"/>
+  <text x="730" y="325" class="signal return" text-anchor="middle">diag_seen</text>
+  <text x="93" y="391" class="signal">clk_100m</text>
+  <path d="M92 402 L230 402" class="wire"/>
+  <text x="55" y="430" class="note">모든 블록의 공통 클록</text>
+  <rect x="62" y="652" width="289" height="171" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="77" y="681" class="module">event_scheduler</text>
+  <text x="77" y="706" class="note">이벤트 스냅샷과 STATUS</text>
+  <text x="77" y="732" class="signal">IN [GPIO], [RUN], [CAPTURE]</text>
+  <text x="77" y="752" class="signal">IN [TICK_US], [OVERFLOW]</text>
+  <rect x="550" y="652" width="204" height="171" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="565" y="681" class="module">event_fifo</text>
+  <text x="565" y="706" class="note">이벤트 16개 보존</text>
+  <text x="565" y="732" class="signal">OUT [OVERFLOW]</text>
+  <rect x="965" y="652" width="196" height="171" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="980" y="681" class="module">frame_encoder</text>
+  <text x="980" y="706" class="note">22 byte·순번·CRC</text>
+  <rect x="1347" y="652" width="194" height="171" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="1362" y="681" class="module">uart_tx</text>
+  <text x="1362" y="706" class="note">115200 baud · 8N1</text>
+  <path d="M155 652 L155 580 L1080 580 L1080 652" class="wire"/>
+  <text x="598" y="569" class="signal" text-anchor="middle">status_req, status_data</text>
+  <path d="M1020 652 L1020 621 L248 621 L248 652" class="wire back"/>
+  <text x="638" y="610" class="signal return" text-anchor="middle">status_accept</text>
+  <path d="M351 757 L550 757" class="wire"/>
+  <text x="451" y="727" class="signal" text-anchor="middle">event_req,</text>
+  <text x="451" y="746" class="signal" text-anchor="middle">event_data</text>
+  <path d="M754 757 L965 757" class="wire"/>
+  <text x="860" y="727" class="signal" text-anchor="middle">event_valid,</text>
+  <text x="860" y="746" class="signal" text-anchor="middle">queued_event</text>
+  <path d="M965 801 L754 801" class="wire back"/>
+  <text x="860" y="791" class="signal return" text-anchor="middle">event_pop</text>
+  <path d="M1161 757 L1347 757" class="wire"/>
+  <text x="1254" y="727" class="signal" text-anchor="middle">byte_valid,</text>
+  <text x="1254" y="746" class="signal" text-anchor="middle">byte_data[7:0]</text>
+  <path d="M1347 801 L1161 801" class="wire back"/>
+  <text x="1254" y="791" class="signal return" text-anchor="middle">byte_ready</text>
+  <path d="M1444 823 L1444 844" class="wire"/>
+  <text x="1438" y="869" class="signal" text-anchor="middle">uart_tx → Jetson USB</text>
+  <text x="51" y="873" class="note">[이름]은 각 위치에 같은 이름을 붙인 공통망이다. 녹색은 입력·데이터, 적갈색은 회신·수락 신호다.</text>
+  <text x="51" y="900" class="signal">[GPIO] ready, diag, diag_rise   [TICK_US] tick_us[31:0]   [TICK_CE] tick_ce   [RST] rst   [OVERFLOW] overflow</text>
+  <text x="51" y="923" class="signal">[RUN] start_evt, inject_evt, end_evt, abort_evt, scenario[7:0], phase[7:0], run_seq[15:0], invalid</text>
+  <text x="1197" y="923" class="signal">[ABORT] aborted_hold</text>
+  <text x="51" y="946" class="signal">[CAPTURE] diag_evt, t1_us[31:0], latency_us[31:0], timing_valid</text>
+  <text x="1315" y="945" class="note" text-anchor="middle">[RST] → 입력 처리 외 9개 블록</text>
+  <rect x="32" y="968" width="1536" height="239" rx="8" fill="#f4f8fa" stroke="#a8bbc1"/>
+  <text x="51" y="998" class="section">Basys3 보드 상태 표시</text>
+  <rect x="790" y="1012" width="315" height="176" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="813" y="1049" class="module">fnd_controller</text>
+  <text x="813" y="1080" class="note">상태 표시 코드 · 4자리 스캔</text>
+  <text x="813" y="1107" class="signal">S / P / R / D</text>
+  <text x="813" y="1131" class="signal">E001 / E002</text>
+  <text x="813" y="1162" class="signal">clk_100m, [RST]</text>
+  <text x="54" y="1034" class="signal">scenario_ctrl</text>
+  <text x="310" y="1030" class="signal">[RUN] scenario, phase, invalid</text>
+  <text x="310" y="1050" class="signal">[ABORT] aborted_hold</text>
+  <path d="M309 1057 L790 1057" class="wire"/>
+  <text x="54" y="1084" class="signal">input_conditioner</text>
+  <text x="310" y="1083" class="signal">[GPIO] ready, diag</text>
+  <path d="M309 1090 L790 1090" class="wire"/>
+  <text x="54" y="1121" class="signal">timebase</text>
+  <text x="310" y="1120" class="signal">[TICK_CE] tick_ce</text>
+  <path d="M309 1127 L790 1127" class="wire"/>
+  <text x="54" y="1158" class="signal">event_fifo</text>
+  <text x="310" y="1157" class="signal">[OVERFLOW] overflow</text>
+  <path d="M309 1164 L790 1164" class="wire"/>
+  <path d="M1105 1097 L1320 1097" class="wire"/>
+  <text x="1213" y="1085" class="signal" text-anchor="middle">an[3:0], seg[7:0]</text>
+  <rect x="1320" y="1062" width="219" height="70" rx="8" fill="#ffffff" stroke="#31545d"/>
+  <text x="1336" y="1090" class="signal">Basys3 FND</text>
+  <text x="1336" y="1114" class="note">내장 4자리 · active-low</text>
+</svg>
