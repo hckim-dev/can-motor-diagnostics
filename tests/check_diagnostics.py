@@ -17,6 +17,7 @@ from backend.can_rx.codec import CanId, State
 from backend.diagnostics.engine import DiagnosticEngine
 from backend.diagnostics.inputs import Input
 from backend.diagnostics.journal import Journal, evaluate, load_manifest, verify_results
+from backend.diagnostics.storage import RecordedLog, segment_name
 from backend.diagnostics.verdict import Config
 
 SESSION = str(UUID(int=1))
@@ -512,6 +513,113 @@ class VerdictTest(unittest.TestCase):
 
 
 class JournalTest(unittest.TestCase):
+    def test_result_sync_failure_leaves_only_confirmed_results(self):
+        for rotate in (False, True):
+            with (
+                self.subTest(rotate=rotate),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                output = Path(directory) / "run"
+                events = []
+                sync = os.fsync
+                failed = False
+                with (
+                    self.assertRaisesRegex(OSError, "판정 동기화 실패"),
+                    Journal(
+                        output, Config(), rotate_bytes=100 if rotate else 1024
+                    ) as journal,
+                ):
+                    journal.on_event = events.append
+                    journal.result({"result": "PASS", "run_id": "완료"})
+                    log = journal.files["events.jsonl"]
+                    previous_size = log.size
+                    expected_segment = 2 if rotate else 1
+
+                    def fail_result_sync(fd):
+                        nonlocal failed
+                        if (
+                            not failed
+                            and fd == log.fileno()
+                            and log.count == expected_segment
+                            and (rotate or log.size > previous_size)
+                        ):
+                            failed = True
+                            raise OSError("판정 동기화 실패")
+                        return sync(fd)
+
+                    with patch(
+                        "backend.diagnostics.journal.os.fsync",
+                        side_effect=fail_result_sync,
+                    ):
+                        journal.result({"result": "PASS", "run_id": "저장 실패"})
+
+                saved = [
+                    json.loads(line)
+                    for path in sorted(output.glob("events.jsonl*"))
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertEqual(saved, events)
+                self.assertEqual(
+                    [event["context"]["run_id"] for event in saved], ["완료"]
+                )
+                self.assertFalse((output / "manifest.json").exists())
+
+    def test_rotated_log_replays_with_original_metadata_and_checks_every_segment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            original = base / "original"
+            config = Config(gpio_verified=True, gpio_limit_us=250_000)
+            metadata = {
+                "firmware_build": {"motor": "mcu-a", "fpga": "fpga-b"},
+                "run_settings": {"encoder_counts_per_rev": 48},
+            }
+            with (
+                FIXTURE.open(encoding="utf-8") as source,
+                Journal(
+                    original, config, metadata=metadata, rotate_bytes=1024
+                ) as journal,
+            ):
+                expected = evaluate(source, journal, config)
+            saved, replay_config = load_manifest(original)
+            self.assertEqual(replay_config, config)
+            for key, value in metadata.items():
+                self.assertEqual(saved[key], value)
+            self.assertGreater(saved["log_segments"]["inputs.jsonl"], 1)
+            inputs = RecordedLog(original, "inputs.jsonl", saved)
+            rows = [json.loads(line) for line in inputs]
+            self.assertEqual(
+                [row["ingest_seq"] for row in rows], list(range(1, len(rows) + 1))
+            )
+            with Journal(base / "replay", replay_config, original=saved) as journal:
+                actual = evaluate(inputs, journal, replay_config)
+                verify_results(original, actual)
+            replayed, _ = load_manifest(base / "replay")
+            self.assertEqual(actual, expected)
+            self.assertEqual(replayed["firmware_build"], metadata["firmware_build"])
+            self.assertEqual(replayed["run_settings"], metadata["run_settings"])
+
+            (original / segment_name("inputs.jsonl", 2)).unlink()
+            with (
+                self.assertRaises(FileNotFoundError),
+                Journal(base / "incomplete", replay_config, original=saved) as journal,
+            ):
+                evaluate(inputs, journal, replay_config)
+            self.assertFalse((base / "incomplete" / "manifest.json").exists())
+
+    def test_result_verification_reads_rotated_event_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "events"
+            with Journal(output, Config(), rotate_bytes=100) as journal:
+                contexts = [
+                    journal.result({"result": "PASS", "run_id": run_id})
+                    for run_id in ("회차1", "회차2")
+                ]
+            saved, _ = load_manifest(output)
+            self.assertEqual(saved["log_segments"], {"events.jsonl": 2})
+            verify_results(output, contexts)
+            with self.assertRaisesRegex(ValueError, "원본 결과와 일치하지 않는다"):
+                verify_results(output, contexts[:1])
+
     def test_close_failure_preserves_active_recording_error(self):
         for error in (None, OSError("UART 수집 실패")):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:

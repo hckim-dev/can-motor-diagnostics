@@ -17,6 +17,8 @@ SERVICES = {
     "stop",
     "reset",
     "recording_failed",
+    "recording_space_low",
+    "recording_space_recovered",
 }
 SERVICE_DETAIL_FIELDS = {
     "can_disconnect": {"reason"},
@@ -26,6 +28,8 @@ SERVICE_DETAIL_FIELDS = {
     "fpga_disconnect": {"reason"},
     "fpga_reconnect": {"attempt"},
     "fpga_retry_failed": {"attempt", "reason"},
+    "recording_space_low": {"free_bytes"},
+    "recording_space_recovered": {"free_bytes"},
 }
 
 
@@ -97,6 +101,13 @@ class Input:
                 or not isinstance(detail, dict)
                 or detail.keys() != SERVICE_DETAIL_FIELDS.get(payload)
                 or ("reason" in detail and not isinstance(detail["reason"], str))
+                or (
+                    "free_bytes" in detail
+                    and (
+                        type(detail["free_bytes"]) is not int
+                        or detail["free_bytes"] < 0
+                    )
+                )
                 or any(
                     type(value) is not int or value <= 0
                     for key, value in detail.items()
@@ -109,6 +120,8 @@ class Input:
             "can_retry_failed",
             "can_rx_overflow",
             "fpga_retry_failed",
+            "recording_space_low",
+            "recording_space_recovered",
         ):
             raise ValueError("서비스 세부 정보 누락")
         record = cls(session, seq, int(raw_time), source, payload, detail)

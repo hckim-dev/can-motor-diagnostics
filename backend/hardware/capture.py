@@ -113,6 +113,7 @@ def capture(devices, readers, journal, config, duration_ns):
     for seq, (now, source, payload, error, detail) in enumerate(
         receive_inputs(devices, readers, duration_ns), 1
     ):
+        journal.check_space()
         record = Input(journal.evidence_session, seq, now, source, payload, detail)
         received, completed = record_input(journal, engine, record)
         counts.update(
@@ -176,7 +177,7 @@ def capture(devices, readers, journal, config, duration_ns):
     }
 
 
-def capture_hardware(output, interface, uart, duration_ns):
+def capture_hardware(output, interface, uart, duration_ns, *, metadata=None):
     config = Config(functional_only=True)
     devices = {}
     readers = {"can": read_can_observation, "fpga": read_uart}
@@ -192,5 +193,5 @@ def capture_hardware(output, interface, uart, duration_ns):
             )
         if uart:
             devices["fpga"] = stack.enter_context(open_uart(uart, discard_pending=True))
-        with Journal(output, config, hardware=hardware) as journal:
+        with Journal(output, config, hardware=hardware, metadata=metadata) as journal:
             return capture(devices, readers, journal, config, duration_ns)

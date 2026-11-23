@@ -7,6 +7,7 @@ import termios
 from pathlib import Path
 
 from ..diagnostics.journal import json_line
+from ..diagnostics.metadata import add_metadata_arguments, recording_metadata
 from ..tcp_stream import PORT
 from .capture import TIME_UNIT_NS, capture_hardware
 from .live_control import serve_live_control
@@ -28,6 +29,7 @@ def main():
     capture.add_argument("--can", help="올라온 SocketCAN 인터페이스 이름")
     capture.add_argument("--uart", type=Path, help="FPGA 전용 tty 경로")
     capture.add_argument("--seconds", type=seconds, default=5.0)
+    add_metadata_arguments(capture)
 
     probe = commands.add_parser("can-tx-probe", help="OP_HELLO 한 프레임을 제출")
     probe.add_argument("--can", required=True)
@@ -66,7 +68,11 @@ def main():
             if not (args.can or args.uart):
                 parser.error("--can 또는 --uart를 하나 이상 지정해야 합니다")
             result = capture_hardware(
-                args.output, args.can, args.uart, int(args.seconds * TIME_UNIT_NS)
+                args.output,
+                args.can,
+                args.uart,
+                int(args.seconds * TIME_UNIT_NS),
+                metadata=recording_metadata(args),
             )
             ok = result["ok"]
         else:

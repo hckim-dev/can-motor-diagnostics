@@ -7,6 +7,7 @@ from contextlib import aclosing
 from ..can_control.controller import CanController
 from ..can_control.tcp import CanControl
 from ..can_rx.state import CanReceiver
+from ..diagnostics.storage import RecordingFailure
 from ..hardware.live_control import MAX_RX_PER_POLL, SocketCanControl
 
 RECORD_LIMIT = 4096
@@ -23,6 +24,7 @@ class ControlFeed:
         self.stream = None
         self.workers = ()
         self.worker_error = None
+        self.dropped_records = 0
 
     def attach_control(self, stream):
         self.stream = stream
@@ -41,13 +43,18 @@ class ControlFeed:
         try:
             self.queue.put_nowait(record)
         except asyncio.QueueFull as exc:
-            raise OSError("통합 제어 기록 큐의 한도를 초과했습니다") from exc
+            self.dropped_records += 1
+            raise RecordingFailure("통합 제어 기록 큐의 한도를 초과했습니다") from exc
 
     async def _receive_uart(self):
         async with aclosing(self.uart_feed.records()) as records:
             async for batch in records:
-                for record in batch:
-                    self._record(record)
+                for index, record in enumerate(batch):
+                    try:
+                        self._record(record)
+                    except RecordingFailure:
+                        self.dropped_records += len(batch) - index - 1
+                        raise
 
     def stop_inputs(self):
         workers, self.workers = self.workers, ()

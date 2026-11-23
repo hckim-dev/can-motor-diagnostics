@@ -6,6 +6,7 @@ import time
 
 from ..diagnostics.inputs import Input
 from ..diagnostics.journal import record_input
+from ..diagnostics.storage import RecordingFailure
 from ..tcp_stream import SNAPSHOT_INTERVAL
 from .tcp import MonitorStream, MonitorView
 
@@ -23,6 +24,9 @@ class Monitor:
         self.events = []
         self.journal.on_event = self._remember_event
         self.finished = False
+        self.batch_end_seq = 0
+        self.unattempted_records = 0
+        self.abandoned_records = 0
         self.stream = MonitorStream(
             journal.backend_session, journal.manifest["source"], self._view()
         )
@@ -77,7 +81,10 @@ class Monitor:
                 if self.engine.fpga_status_watchdog
                 else self.fpga_last_ns
             ),
-            healthy_recording=self.engine.healthy_recording,
+            healthy_recording=(
+                self.engine.healthy_recording
+                and self.engine.low_space_record_id is None
+            ),
         )
 
     def _consume(self, batch):
@@ -98,7 +105,16 @@ class Monitor:
             )
 
     def _consume_records(self, batch):
+        self.batch_end_seq = self.engine.ingest_seq + len(batch)
+        self.unattempted_records = len(batch)
+        if not self.finished and (event := self.journal.check_space()) is not None:
+            now = batch[0][0] if batch else self.engine.now_ns
+            self.batch_end_seq += 1
+            notice = (now, "service", event, {"free_bytes": self.journal.free_bytes})
+            (record,) = self._batch_inputs((notice,))
+            record_input(self.journal, self.engine, record)
         for record in self._batch_inputs(batch):
+            self.unattempted_records -= 1
             received, _ = record_input(self.journal, self.engine, record)
             if record.source == "fpga":
                 for observation in received:
@@ -112,7 +128,10 @@ class Monitor:
 
     def _save_remaining_inputs(self, batch):
         # 수집 장애로 중단된 기록에는 판정을 추가하지 않는다.
+        self.batch_end_seq = self.engine.ingest_seq + len(batch)
+        self.unattempted_records = len(batch)
         for record in self._batch_inputs(batch):
+            self.unattempted_records -= 1
             self.journal.input(record, None, None)
         self.journal.flush()
 
@@ -126,6 +145,35 @@ class Monitor:
         self.journal.finish(self.engine)
         return self._publication()
 
+    def _recording_failure(self, error):
+        self.engine.fail_recording(self.journal.last_saved_run_id)
+        self.events.clear()
+        result = self.engine.latest_result
+        if result is not None and result.get("evidence_saved") is not False:
+            result = None
+        outside_batch = self.abandoned_records + getattr(
+            self.feed, "dropped_records", 0
+        )
+        dropped = self.unattempted_records + outside_batch
+        report = {
+            "reason": "RECORDING_FAILED",
+            "error": str(error),
+            "dropped_records": dropped,
+            "unconfirmed_records": (
+                max(self.batch_end_seq, self.journal.last_input_seq)
+                - self.journal.durable_input_seq
+                + outside_batch
+            ),
+            "result": result,
+        }
+        LOGGER.error(
+            "기록 중단: %s (미기록 %d건, 저장 미확인 %d건)",
+            error,
+            dropped,
+            report["unconfirmed_records"],
+        )
+        return self._view(), report
+
     async def _write(self, work, *args):
         task = asyncio.create_task(asyncio.to_thread(work, *args))
         try:
@@ -136,12 +184,39 @@ class Monitor:
             raise
 
     async def _publish_from(self, work, *args):
-        snapshot, events = await self._write(work, *args)
+        try:
+            snapshot, events = await self._write(work, *args)
+        except OSError as exc:
+            raise RecordingFailure(str(exc)) from exc
         if self.observe_devices is not None:
             self.observe_devices(snapshot)
+        self.stream.recording = (
+            {"reason": "RECORDING_SPACE_LOW", "free_bytes": self.journal.free_bytes}
+            if self.journal.space_low
+            else None
+        )
         self.stream.publish(snapshot, events)
 
     async def run(self, stop):
+        try:
+            await self._run(stop)
+        except RecordingFailure as exc:
+            if final_records := getattr(self.feed, "final_records", None):
+                self.abandoned_records += len(final_records())
+            snapshot, report = self._recording_failure(exc)
+            self.stream.recording = {
+                key: report[key]
+                for key in ("reason", "dropped_records", "unconfirmed_records")
+            }
+            self.stream.publish(snapshot, ())
+            try:
+                await self._write(self.journal.report_failure, report)
+            except OSError:
+                # 원래 기록 장치가 가득 차면 TCP와 시스템 로그에 상태를 남긴다.
+                LOGGER.warning("기록 실패 보고서를 저장하지 못했습니다", exc_info=True)
+            raise
+
+    async def _run(self, stop):
         records = self.feed.records()
         read = None if stop.is_set() else asyncio.create_task(anext(records))
         stopping = asyncio.create_task(self._watch_stop(stop))
@@ -183,7 +258,13 @@ class Monitor:
             tasks = (read, stopping) if read is not None else (stopping,)
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            outcome = await asyncio.gather(*tasks, return_exceptions=True)
+            if (
+                isinstance(active_error, RecordingFailure)
+                and read is not None
+                and not isinstance(outcome[0], BaseException)
+            ):
+                self.abandoned_records += len(outcome[0])
             await self._close_inputs(records, active_error, failed_batch)
 
         if not self.finished:
@@ -208,7 +289,13 @@ class Monitor:
                 batch = (*failed_batch, *self.feed.final_records())
                 await self._write(self._save_remaining_inputs, batch)
             except OSError as exc:
-                LOGGER.warning("수집 종료 시 남은 원본 저장 실패: %s", exc)
+                raise RecordingFailure(
+                    f"{error}; 종료 원본 저장 실패: {exc}"
+                ) from error
+            if getattr(self.feed, "dropped_records", 0) and not isinstance(
+                error, RecordingFailure
+            ):
+                raise RecordingFailure(f"{error}; 기록 큐 한도 초과") from error
         if close_error is not None and close_error is not error:
             LOGGER.warning("수집 입력 종료 실패: %s", close_error)
         if active_error is None and error is not None:

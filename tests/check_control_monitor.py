@@ -1,13 +1,14 @@
 """한 TCP 세션에서 CAN 조작과 UART 시험 기록을 검증한다."""
 
 import asyncio
+import errno
 import json
 import tempfile
 import threading
 import time
 import unittest
 import uuid
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, nullcontext, suppress
 from pathlib import Path
 from unittest.mock import patch
 
@@ -82,6 +83,112 @@ async def heartbeat(writer, stream):
 
 
 class ControlMonitorTest(unittest.IsolatedAsyncioTestCase):
+    async def test_storage_failure_during_collection_cleanup_reports_both_errors(self):
+        async def idle_can(_stream):
+            await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "record"
+            config = Config()
+            with (
+                self.assertLogs("backend.monitor.service", "ERROR"),
+                self.assertRaisesRegex(OSError, "UART 수집 실패.*종료 원본 저장 실패"),
+                Journal(output, config) as journal,
+            ):
+                feed = ControlFeed(None, DeviceFeed({}, {}), boot_id=1)
+                monitor = Monitor(journal, config, feed)
+
+                async def faulty_uart():
+                    now = time.monotonic_ns()
+                    feed._record((now, "fpga", b"\x00"))
+                    feed._record((now, "fpga", b"\x01"))
+                    raise OSError("UART 수집 실패")
+
+                with (
+                    patch.object(feed.bus, "run", side_effect=idle_can),
+                    patch.object(feed, "_receive_uart", side_effect=faulty_uart),
+                    patch.object(
+                        journal,
+                        "input",
+                        side_effect=OSError(errno.ENOSPC, "디스크 공간 부족"),
+                    ),
+                ):
+                    await asyncio.wait_for(monitor.run(asyncio.Event()), 3)
+
+            (report,) = rows_in(output / "recording-failure.json")
+            self.assertIn("UART 수집 실패", report["error"])
+            self.assertIn("디스크 공간 부족", report["error"])
+            self.assertEqual(report["dropped_records"], 1)
+            self.assertEqual(report["unconfirmed_records"], 2)
+            self.assertEqual(
+                monitor.stream.snapshot(None, None)["services"]["log"], "DEGRADED"
+            )
+            self.assertFalse((output / "manifest.json").exists())
+
+    async def test_write_failure_submits_inhibit_and_disables_can_control(self):
+        can = DatagramCan()
+        self.addCleanup(can.close)
+        can.inject(*MockMotor().state_frames())
+        config = Config()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "record"
+            with (
+                self.assertLogs("backend.monitor.service", "ERROR"),
+                self.assertRaisesRegex(OSError, "디스크 공간 부족"),
+                Journal(output, config) as journal,
+            ):
+                feed = ControlFeed(lambda: can, DeviceFeed({}, {}), boot_id=1)
+                monitor = Monitor(journal, config, feed)
+                with (
+                    patch.object(
+                        journal,
+                        "input",
+                        side_effect=OSError(errno.ENOSPC, "디스크 공간 부족"),
+                    ),
+                    patch.object(can, "send", wraps=can.send) as sent,
+                ):
+                    try:
+                        await asyncio.wait_for(monitor.run(asyncio.Event()), 3)
+                    finally:
+                        packet = sent.call_args.args[0]
+                        frame = unpack_frame(packet)
+                        self.assertEqual(frame.can_id, CanId.OP_PERMIT)
+                        self.assertEqual(decode_frame(frame).flags, STOP_REQUESTED)
+                        self.assertFalse(feed.stream.control.controller.can_connected)
+                        self.assertEqual(can.socket.fileno(), -1)
+
+            self.assertFalse((output / "manifest.json").exists())
+
+    async def test_record_queue_overflow_counts_rejected_uart_batch(self):
+        class UartBatch(DeviceFeed):
+            async def records(self):
+                now = self.now_ns()
+                yield tuple((now, "fpga", bytes([value])) for value in range(3))
+
+        async def idle_can(_stream):
+            await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "record"
+            config = Config()
+            with (
+                self.assertLogs("backend.monitor.service", "ERROR"),
+                self.assertRaisesRegex(OSError, "기록 큐"),
+                Journal(output, config) as journal,
+            ):
+                feed = ControlFeed(None, UartBatch({}, {}), boot_id=1)
+                feed.queue = asyncio.Queue(maxsize=1)
+                monitor = Monitor(journal, config, feed)
+                with patch.object(feed.bus, "run", side_effect=idle_can):
+                    await asyncio.wait_for(monitor.run(asyncio.Event()), 3)
+
+            (saved,) = rows_in(output / "inputs.jsonl")
+            self.assertEqual(saved["hex"], "00")
+            (report,) = rows_in(output / "recording-failure.json")
+            self.assertEqual(report["dropped_records"], 2)
+            self.assertEqual(report["unconfirmed_records"], 3)
+            self.assertFalse((output / "manifest.json").exists())
+
     async def test_final_input_from_failed_worker_cannot_publish_verdict(self):
         rows = scenario_rows(1, latency=None, fault=0)
         config = Config(gpio_verified=True)
@@ -145,7 +252,12 @@ class ControlMonitorTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(stop_requested=stop_requested):
                 await self.verify_worker_failure_preserves_inputs(stop_requested)
 
-    async def verify_worker_failure_preserves_inputs(self, stop_requested):
+    async def test_uart_failure_reports_inhibit_record_dropped_at_queue_limit(self):
+        await self.verify_worker_failure_preserves_inputs(False, full_queue=True)
+
+    async def verify_worker_failure_preserves_inputs(
+        self, stop_requested, *, full_queue=False
+    ):
         writing = asyncio.Event()
         fail_uart = asyncio.Event()
         stop = asyncio.Event()
@@ -159,9 +271,16 @@ class ControlMonitorTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "record"
             config = Config()
-            with self.assertRaisesRegex(OSError, "모의 UART 수집 실패"):
+            expected_error = "모의 UART 수집 실패"
+            logs = nullcontext()
+            if full_queue:
+                expected_error += ".*기록 큐"
+                logs = self.assertLogs("backend.monitor.service", "ERROR")
+            with logs, self.assertRaisesRegex(OSError, expected_error):
                 with Journal(output, config) as journal:
                     feed = ControlFeed(lambda: can, DeviceFeed({}, {}), boot_id=1)
+                    if full_queue:
+                        feed.queue = asyncio.Queue(maxsize=32)
                     monitor = Monitor(journal, config, feed)
                     consume = monitor._consume
 
@@ -173,6 +292,9 @@ class ControlMonitorTest(unittest.IsolatedAsyncioTestCase):
 
                     async def faulty_uart():
                         await fail_uart.wait()
+                        if full_queue:
+                            while feed.queue.qsize() < feed.queue.maxsize - 1:
+                                feed._record((time.monotonic_ns(), "service", "clock"))
                         feed._record((time.monotonic_ns(), "fpga", uart_data))
                         raise OSError("모의 UART 수집 실패")
 
@@ -201,9 +323,17 @@ class ControlMonitorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [row["ingest_seq"] for row in rows], list(range(1, len(rows) + 1))
             )
-            self.assertEqual(
-                (rows[-1]["source"], rows[-1]["can_id"]), ("can_tx", CanId.OP_PERMIT)
-            )
+            if full_queue:
+                self.assertEqual(rows[-1], uart_row)
+                (report,) = rows_in(output / "recording-failure.json")
+                self.assertEqual(report["dropped_records"], 1)
+                self.assertEqual(report["unconfirmed_records"], len(rows) + 1)
+                self.assertEqual(monitor.stream.recording["reason"], "RECORDING_FAILED")
+            else:
+                self.assertEqual(
+                    (rows[-1]["source"], rows[-1]["can_id"]),
+                    ("can_tx", CanId.OP_PERMIT),
+                )
             self.assertFalse((output / "manifest.json").exists())
             self.assertEqual(rows_in(output / "events.jsonl"), [])
 

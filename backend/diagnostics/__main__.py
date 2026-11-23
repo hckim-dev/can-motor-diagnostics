@@ -2,10 +2,13 @@
 
 import argparse
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from .journal import Journal, evaluate, json_line, load_manifest, verify_results
-from .verdict import Config
+from .metadata import add_metadata_arguments, positive, recording_metadata
+from .storage import RecordedLog
+from .verdict import GPIO_LIMIT_US, Config
 
 
 class ReplayClock:
@@ -39,6 +42,8 @@ def main():
     record.add_argument(
         "--functional-only", action="store_true", help="기능 관측만 기록"
     )
+    record.add_argument("--gpio-limit-us", type=positive, default=GPIO_LIMIT_US)
+    add_metadata_arguments(record)
 
     replay = commands.add_parser("replay")
     replay.add_argument("source", type=Path, help="원본 기록 디렉터리")
@@ -51,18 +56,24 @@ def main():
     try:
         original = None
         pace = None
-        source = args.source
+        metadata = None
         if args.command == "replay":
-            original, config = load_manifest(source)
-            source = source / "inputs.jsonl"
+            original, config = load_manifest(args.source)
+            source = nullcontext(RecordedLog(args.source, "inputs.jsonl", original))
             pace = ReplayClock(args.fast)
         else:
             config = Config(
-                gpio_verified=args.gpio_verified, functional_only=args.functional_only
+                gpio_verified=args.gpio_verified,
+                functional_only=args.functional_only,
+                gpio_limit_us=args.gpio_limit_us,
             )
+            metadata = recording_metadata(args)
+            source = args.source.open(encoding="utf-8")
         with (
-            source.open(encoding="utf-8") as file,
-            Journal(args.output, config, original=original) as journal,
+            source as file,
+            Journal(
+                args.output, config, original=original, metadata=metadata
+            ) as journal,
         ):
             results = evaluate(file, journal, config, pace=pace)
             if original is not None:

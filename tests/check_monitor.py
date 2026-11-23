@@ -16,6 +16,7 @@ import uuid
 from ast import literal_eval
 from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from check_diagnostics import scenario_rows, service
@@ -24,7 +25,8 @@ from check_measurement_recording import EPOCH, MS, hello, sample, state
 from backend.can_control.wire import encode_operator_hello, encode_permit
 from backend.can_rx.codec import Frame, Mode, State
 from backend.diagnostics.inputs import Input
-from backend.diagnostics.journal import Journal
+from backend.diagnostics.journal import Journal, evaluate, load_manifest
+from backend.diagnostics.storage import RecordedLog
 from backend.diagnostics.verdict import Config
 from backend.hardware.socketcan import (
     CAN_ERR_BUSOFF,
@@ -144,6 +146,73 @@ class SnapshotFreshnessTest(unittest.TestCase):
 
 
 class MonitorTest(unittest.IsolatedAsyncioTestCase):
+    async def test_low_space_blocks_new_verdict_even_after_recovery_and_replay(self):
+        for link_evidence in (False, True):
+            with self.subTest(link_evidence=link_evidence):
+                await self.verify_low_space_replay(link_evidence)
+
+    async def verify_low_space_replay(self, link_evidence):
+        rows = scenario_rows()
+        config = Config(gpio_verified=True)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            with Journal(output, config, low_space_bytes=1000) as journal:
+                if not link_evidence:
+                    journal.manifest.pop("recording_policy_version")
+                monitor = Monitor(journal, config, DeviceFeed({}, {}))
+                batch = []
+                for index, row in enumerate(rows, 1):
+                    record = Input.from_row(row, journal.evidence_session, index)
+                    batch.append(
+                        (
+                            record.rx_mono_ns,
+                            record.source,
+                            record.payload,
+                            record.detail,
+                        )
+                    )
+
+                with (
+                    self.assertLogs("backend.diagnostics.journal", "WARNING"),
+                    patch(
+                        "backend.diagnostics.journal.shutil.disk_usage",
+                        side_effect=[
+                            SimpleNamespace(free=1000),
+                            SimpleNamespace(free=1001),
+                        ],
+                    ),
+                    patch(
+                        "backend.diagnostics.journal.monotonic_ns",
+                        side_effect=[0, 1_000_000_000],
+                    ),
+                ):
+                    await monitor._publish_from(monitor._consume, batch[:5])
+                    self.assertEqual(
+                        monitor.stream.recording["reason"], "RECORDING_SPACE_LOW"
+                    )
+                    await monitor._publish_from(monitor._finish, batch[5:])
+                    self.assertIsNone(monitor.stream.recording)
+
+            (event,) = rows_in(output / "events.jsonl")
+            self.assertEqual(event["code"], "INCONCLUSIVE")
+            self.assertEqual(event["context"]["reason"], "RECORDING_SPACE_LOW")
+            (warning,) = [
+                row
+                for row in rows_in(output / "inputs.jsonl")
+                if row.get("event") == "recording_space_low"
+            ]
+            self.assertEqual(
+                warning["record_id"] in event["context"]["evidence_ids"], link_evidence
+            )
+            manifest, replay_config = load_manifest(output)
+            source = RecordedLog(output, "inputs.jsonl", manifest)
+            with Journal(
+                output.with_name("replay"), replay_config, original=manifest
+            ) as journal:
+                self.assertEqual(
+                    evaluate(source, journal, replay_config), [event["context"]]
+                )
+
     async def test_fixture_cli_connects_tcp_to_record_and_replay(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -529,6 +598,22 @@ class MonitorTest(unittest.IsolatedAsyncioTestCase):
                             reader, lambda snap: snap["test"]["status"] == "RUNNING"
                         )
                         self.assertTrue(await asyncio.to_thread(writing.wait, 2))
+                        snapshot = await snapshot_where(
+                            reader,
+                            lambda snap: (
+                                snap.get("recording", {}).get("reason")
+                                == "RECORDING_FAILED"
+                            ),
+                        )
+                        self.assertEqual(snapshot["services"]["log"], "DEGRADED")
+                        self.assertEqual(snapshot["test"]["status"], "INCONCLUSIVE")
+                        self.assertEqual(snapshot["test"]["reason"], "RECORDING_FAILED")
+                        self.assertGreater(
+                            snapshot["recording"]["unconfirmed_records"], 0
+                        )
             self.assertFalse((output / "manifest.json").exists())
             self.assertEqual(rows_in(output / "events.jsonl"), [])
             self.assertEqual(list(monitor.stream.events), [])
+            (failure,) = rows_in(output / "recording-failure.json")
+            self.assertEqual(failure["result"]["result"], "INCONCLUSIVE")
+            self.assertFalse(failure["result"]["evidence_saved"])

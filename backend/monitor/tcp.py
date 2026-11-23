@@ -91,6 +91,7 @@ class MonitorStream(TcpStream):
         self.source = source
         self.latest = initial
         self.events = deque()
+        self.recording = None
 
     def open_session(self, stream_id):
         if self.control is not None:
@@ -106,7 +107,10 @@ class MonitorStream(TcpStream):
             self.control.drain()
 
     def snapshot(self, session, now):
-        return self.latest.at(time.monotonic_ns())
+        snapshot = self.latest.at(time.monotonic_ns())
+        if self.recording is not None:
+            snapshot["recording"] = self.recording
+        return snapshot
 
     def publish(self, snapshot, events):
         self.latest = snapshot

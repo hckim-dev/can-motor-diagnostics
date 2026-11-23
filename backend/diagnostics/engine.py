@@ -55,6 +55,7 @@ class DiagnosticEngine:
         *,
         on_sample=None,
         fpga_status_watchdog=False,
+        link_low_space_evidence=True,
     ):
         self.backend_session = backend_session
         self.config = config
@@ -72,6 +73,8 @@ class DiagnosticEngine:
         self.fpga_status_ns = None
         self.idle_evidence: tuple[str, ...] = ()
         self.healthy_recording = True
+        self.link_low_space_evidence = link_low_space_evidence
+        self.low_space_record_id = None
         self.trial: Trial | None = None
         self.now_ns = 0
         self.ingest_seq = 0
@@ -326,6 +329,10 @@ class DiagnosticEngine:
         self.trial = trial
         if not self.healthy_recording:
             trial.add_issue("RECORDING_FAILED")
+        if self.low_space_record_id is not None:
+            trial.add_issue("RECORDING_SPACE_LOW")
+            if self.link_low_space_evidence:
+                trial.add_evidence(self.low_space_record_id)
         if not baseline or not self.idle_evidence:
             trial.add_issue("MID_RUN_ATTACH")
         if self.fpga_status_watchdog and (
@@ -483,6 +490,12 @@ class DiagnosticEngine:
             if self._deadline() is not None and self.now_ns >= self._deadline():
                 self._close(self._deadline())
             return
+        if event == "recording_space_low":
+            self.low_space_record_id = record.record_id
+            return
+        if event == "recording_space_recovered":
+            self.low_space_record_id = None
+            return
         if event == "recording_failed":
             self.healthy_recording = False
             self.can.samples.reset()
@@ -569,3 +582,19 @@ class DiagnosticEngine:
             "result": "RUNNING",
             "reason": "RESULT_PENDING" if self._deadline() else None,
         }
+
+    def fail_recording(self, last_saved_run_id):
+        self.healthy_recording = False
+        if self.trial is not None:
+            self.trial.add_issue("RECORDING_FAILED")
+            self._close(self.now_ns)
+
+        result = self.latest_result
+        if result is not None and result["run_id"] != last_saved_run_id:
+            self.latest_result = {
+                **result,
+                "result": "INCONCLUSIVE",
+                "reason": "RECORDING_FAILED",
+                "issues": list(dict.fromkeys((*result["issues"], "RECORDING_FAILED"))),
+                "evidence_saved": False,
+            }

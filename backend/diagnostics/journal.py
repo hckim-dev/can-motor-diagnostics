@@ -3,24 +3,33 @@
 import json
 import logging
 import os
+import shutil
 from contextlib import ExitStack
 from dataclasses import asdict, fields
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
+from time import monotonic_ns
 from uuid import UUID, uuid4
 
 from ..can_rx.codec import message_motor_boot
 from .engine import DiagnosticEngine
 from .inputs import Input
 from .measurements import MeasurementLog
+from .storage import (
+    LOG_NAMES,
+    LOW_SPACE_BYTES,
+    ROTATE_BYTES,
+    RecordedLog,
+    SegmentedFile,
+    validate_segments,
+)
 from .verdict import Config
 
 FORMAT_VERSION = 1
+RECORDING_POLICY_VERSION = 1
 PROTOCOL_VERSION = {"can": "2.1", "fpga_uart": "1.0"}
 UTC_ZONE = timezone(timedelta(0))
-JOURNALS = ("inputs.jsonl", "raw_can.jsonl", "raw_fpga.jsonl", "events.jsonl")
-MEASUREMENTS = ("samples.csv", "operations.jsonl")
 FLUSH_INTERVAL_NS = 1_000_000_000
 LOGGER = logging.getLogger(__name__)
 
@@ -70,6 +79,9 @@ def load_manifest(path: Path):
             raise ValueError("기록 세션 ID 형식 오류")
     if manifest.get("protocol_version") != PROTOCOL_VERSION:
         raise ValueError("지원하지 않는 기록의 통신 규격")
+    policy = manifest.get("recording_policy_version", 0)
+    if type(policy) is not int or policy not in (0, RECORDING_POLICY_VERSION):
+        raise ValueError("지원하지 않는 기록 운영 정책 버전")
     values = manifest.get("config")
     if not isinstance(values, dict) or values.keys() != {
         item.name for item in fields(Config)
@@ -78,12 +90,16 @@ def load_manifest(path: Path):
     config = Config(**values)
     if manifest["scenario_version"] != config.scenario_version:
         raise ValueError("기록의 시험 프로파일 불일치")
+    validate_segments(manifest)
     return manifest, config
 
 
 def verify_results(directory: Path, results):
-    with (directory / "events.jsonl").open(encoding="utf-8") as source:
-        saved = [json.loads(line)["context"] for line in source]
+    manifest, _ = load_manifest(directory)
+    saved = [
+        json.loads(line)["context"]
+        for line in RecordedLog(directory, "events.jsonl", manifest)
+    ]
     if saved != results:
         raise ValueError("리플레이 판정이 원본 결과와 일치하지 않는다")
 
@@ -100,12 +116,29 @@ def verify_source(source, manifest):
         digest.update(json_line(original_row(record, rx_utc)).encode("utf-8"))
     if digest.hexdigest() != manifest["input_sha256"]:
         raise ValueError("원본 입력의 해시 불일치")
-    source.seek(0)
+    if not isinstance(source, RecordedLog):
+        source.seek(0)
 
 
 class Journal:
-    def __init__(self, directory, config, *, original=None, hardware=None):
+    def __init__(
+        self,
+        directory,
+        config,
+        *,
+        original=None,
+        hardware=None,
+        metadata=None,
+        rotate_bytes=ROTATE_BYTES,
+        low_space_bytes=LOW_SPACE_BYTES,
+    ):
+        if type(rotate_bytes) is not int or rotate_bytes <= 0:
+            raise ValueError("기록 회전 크기는 양의 정수여야 한다")
+        if type(low_space_bytes) is not int or low_space_bytes < 0:
+            raise ValueError("기록 여유 공간 기준은 음이 아닌 정수여야 한다")
         self.directory = directory
+        self.rotate_bytes = rotate_bytes
+        self.low_space_bytes = low_space_bytes
         self.backend_session = str(uuid4())
         self.evidence_session = (
             original["evidence_session"] if original else self.backend_session
@@ -125,22 +158,36 @@ class Journal:
             "config": asdict(config),
             "started_utc": utc_now(),
         }
+        if original:
+            for key in ("firmware_build", "run_settings", "recording_policy_version"):
+                if key in original:
+                    self.manifest[key] = original[key]
+        else:
+            self.manifest["recording_policy_version"] = RECORDING_POLICY_VERSION
+            if metadata:
+                self.manifest["firmware_build"] = metadata["firmware_build"]
+                self.manifest["run_settings"] = metadata["run_settings"]
         if hardware or (original and "hardware" in original):
             self.manifest["hardware"] = hardware or original["hardware"]
         self._stack = ExitStack()
         self._digest = sha256()
         self._last_flush_ns = None
         self._needs_finish = False
+        self._finished = False
+        self._space_checked_ns = None
+        self.free_bytes = None
+        self.space_low = False
+        self.last_input_seq = self.durable_input_seq = 0
+        self.last_saved_run_id = None
 
     def __enter__(self):
         self.directory.mkdir(parents=True, exist_ok=False)
         try:
-            self.files = {
-                name: self._stack.enter_context(
-                    (self.directory / name).open("x", encoding="utf-8", newline="")
-                )
-                for name in (*JOURNALS, *MEASUREMENTS)
-            }
+            self.files = {}
+            for name in LOG_NAMES:
+                file = SegmentedFile(self.directory, name, self.rotate_bytes, sync)
+                self._stack.callback(file.close)
+                self.files[name] = file
             self.measurements = MeasurementLog(
                 self.files["samples.csv"],
                 self.evidence_session,
@@ -155,9 +202,8 @@ class Journal:
     def __exit__(self, exc_type, exc, traceback):
         active_error = exc
         try:
-            if exc_type is None:
-                for file in self.files.values():
-                    sync(file)
+            if exc_type is None and not self._finished:
+                self.sync_files()
         except BaseException as sync_error:
             active_error = sync_error
             raise
@@ -176,22 +222,23 @@ class Journal:
 
     def _publish_manifest(self):
         self.manifest["input_sha256"] = self._digest.hexdigest()
+        segments = {
+            name: file.count for name, file in self.files.items() if file.count > 1
+        }
+        if segments:
+            self.manifest["log_segments"] = segments
         temporary = self.directory / ".manifest.tmp"
         published = self.directory / "manifest.json"
         with temporary.open("x", encoding="utf-8") as file:
             file.write(json_line(self.manifest))
             sync(file)
-        fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        temporary.rename(published)
         try:
-            temporary.rename(published)
-            try:
-                os.fsync(fd)
-            except OSError:
-                # 디렉터리 반영에 실패한 기록이 리플레이에 노출되지 않게 한다.
-                published.unlink()
-                raise
-        finally:
-            os.close(fd)
+            self._sync_directory()
+        except OSError:
+            # 디렉터리 반영에 실패한 기록이 리플레이에 노출되지 않게 한다.
+            published.unlink()
+            raise
 
     def input(self, record, original_utc, replay_ns):
         row = original_row(record, original_utc if self.original else utc_now())
@@ -199,7 +246,46 @@ class Journal:
         if replay_ns is not None:
             row["replay_mono_ns"] = str(replay_ns)
         self.files["inputs.jsonl"].write(json_line(row))
+        self.last_input_seq = record.ingest_seq
         return row
+
+    def check_space(self):
+        now = monotonic_ns()
+        checked = self._space_checked_ns
+        if checked is not None and now - checked < FLUSH_INTERVAL_NS:
+            return None
+        self.free_bytes = shutil.disk_usage(self.directory).free
+        self._space_checked_ns = now
+        low = self.free_bytes <= self.low_space_bytes
+        if low == self.space_low:
+            return None
+        self.space_low = low
+        if low:
+            LOGGER.warning("기록 저장 공간 부족: %d바이트 남음", self.free_bytes)
+        return "recording_space_low" if low else "recording_space_recovered"
+
+    def report_failure(self, report):
+        temporary = self.directory / ".recording-failure.tmp"
+        with temporary.open("x", encoding="utf-8") as file:
+            file.write(json_line({"backend_session": self.backend_session, **report}))
+            sync(file)
+        temporary.rename(self.directory / "recording-failure.json")
+        self._sync_directory()
+
+    def sync_files(self, *, include_events=True):
+        for name, file in self.files.items():
+            if include_events or name != "events.jsonl":
+                sync(file)
+        self._sync_directory()
+        if include_events:
+            self.durable_input_seq = self.last_input_seq
+
+    def _sync_directory(self):
+        fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def verify_input(self):
         if self.original and self._digest.hexdigest() != self.original["input_sha256"]:
@@ -212,6 +298,11 @@ class Journal:
             config,
             on_sample=self.measurements.completed.append,
             fpga_status_watchdog=hardware.get("fpga_status_watchdog") is True,
+            link_low_space_evidence=(
+                # 이전 기록은 저장 당시의 판정 근거 목록을 유지한다.
+                self.manifest.get("recording_policy_version")
+                == RECORDING_POLICY_VERSION
+            ),
         )
         self._needs_finish = True
         return engine
@@ -276,9 +367,7 @@ class Journal:
             )
 
     def result(self, context):
-        for name, file in self.files.items():
-            if name != "events.jsonl":
-                sync(file)
+        self.sync_files(include_events=False)
         event = {
             "event_id": str(uuid4()),
             "rx_utc": utc_now(),
@@ -286,8 +375,9 @@ class Journal:
             "code": context["result"],
             "context": {**context, "evidence_saved": True},
         }
-        self.files["events.jsonl"].write(json_line(event))
-        sync(self.files["events.jsonl"])
+        self.files["events.jsonl"].write_synced(json_line(event), self._sync_directory)
+        self.durable_input_seq = self.last_input_seq
+        self.last_saved_run_id = context["run_id"]
         if self.on_event is not None:
             self.on_event(event)
         return event["context"]
@@ -298,12 +388,13 @@ class Journal:
     def finish(self, engine):
         self.measurements.finish(engine)
         results = [self.result(context) for context in engine.finish()]
-        self.flush()
+        self.sync_files()
         self.manifest["can_rx"] = {
             "socket_dropped_frames": engine.can_socket_drops,
             "unobserved_sample_sequences": engine.can.samples.sequence_gaps,
         }
         self._needs_finish = False
+        self._finished = True
         return results
 
 

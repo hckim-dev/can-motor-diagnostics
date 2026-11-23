@@ -9,7 +9,9 @@ from pathlib import Path
 
 from ..can_control.boot_id import boot_id_session
 from ..diagnostics.journal import Journal
-from ..diagnostics.verdict import Config
+from ..diagnostics.metadata import add_metadata_arguments, positive, recording_metadata
+from ..diagnostics.storage import RecordingFailure
+from ..diagnostics.verdict import GPIO_LIMIT_US, Config
 from ..hardware.socketcan import open_can, read_can_observation
 from ..hardware.uart import open_uart, read_uart
 from ..tcp_stream import PORT, listen, shutdown_signal
@@ -22,7 +24,11 @@ async def serve(journal, config, feed, host, port):
     monitor = Monitor(journal, config, feed)
     with shutdown_signal() as stop:
         async with listen(monitor.stream, host, port):
-            await monitor.run(stop)
+            try:
+                await monitor.run(stop)
+            except RecordingFailure:
+                await stop.wait()
+                raise
 
 
 def main():
@@ -38,6 +44,8 @@ def main():
     parser.add_argument(
         "--gpio-verified", action="store_true", help="모의 GPIO 검증 전제"
     )
+    parser.add_argument("--gpio-limit-us", type=positive, default=GPIO_LIMIT_US)
+    add_metadata_arguments(parser)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()
@@ -57,8 +65,13 @@ def main():
     elif args.boot_id_file:
         parser.error("--boot-id-file에는 --motor-power-off가 필요합니다")
 
-    config = Config(gpio_verified=args.gpio_verified, functional_only=not args.fixture)
     try:
+        config = Config(
+            gpio_verified=args.gpio_verified,
+            functional_only=not args.fixture,
+            gpio_limit_us=args.gpio_limit_us,
+        )
+        metadata = recording_metadata(args)
         with ExitStack() as stack:
             hardware = None
             if args.fixture:
@@ -73,7 +86,7 @@ def main():
                 boot_id = stack.enter_context(boot_id_session(args.boot_id_file))
                 hardware["operator_boot_id"] = boot_id
             journal = stack.enter_context(
-                Journal(args.output, config, hardware=hardware)
+                Journal(args.output, config, hardware=hardware, metadata=metadata)
             )
             feed = (
                 FixtureFeed(file, journal.evidence_session)

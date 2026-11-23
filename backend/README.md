@@ -90,6 +90,13 @@ python3 -X dev -W error -m unittest discover -s tests -p 'check_diagnostics.py' 
 
 리플레이는 원본 설정과 입력 해시를 검사하고 원래 순서·단조 시각으로 판정합니다. 기본 재생 속도는 1배속이며 `--fast`로 대기만 건너뛸 수 있습니다. 결과와 증거 ID를 대조하고 `replay_of`가 있는 별도 디렉터리에 판정·샘플·운전 회차를 재구성합니다.
 
+### 기록 운영
+
+- `backend.monitor`, `backend.diagnostics record`, `backend.hardware capture`는 확인한 빌드 ID(`--motor-build`, `--fpga-build`)와 펌웨어 설정(`--encoder-counts-per-rev`, `--rpm-max`, `--feedback-timeout-ms`)을 매니페스트에 남깁니다. 생략한 값은 `null`입니다. 관측·판정 서비스와 예제 기록의 `--gpio-limit-us`는 판정 설정이며 리플레이에도 적용됩니다.
+- 로그는 100MiB에서 행 단위로 분할합니다. 단일 행이 한도보다 크면 그 행을 하나의 파일에 유지합니다. 첫 파일은 기존 이름을 쓰고 두 번째부터 `.000002`를 붙입니다. CSV 헤더는 첫 파일에 있으며, 자동 리플레이는 매니페스트의 `log_segments` 순서를 사용합니다. 오래된 파일은 자동 삭제하지 않습니다.
+- 통합 모니터는 여유 공간이 1GiB 이하일 때 `services.log=DEGRADED`와 `recording.free_bytes`를 보고합니다. 이 구간에서 시작한 시험은 `INCONCLUSIVE / RECORDING_SPACE_LOW`로 기록하고 경고 원본 ID를 판정 근거에 연결합니다. 공간이 회복되면 이후 시험을 정상 판정할 수 있습니다. 수신 전용 캡처 CLI에서는 용량 경고를 로그에 남깁니다.
+- 통합 모니터에서 쓰기·동기화 실패 또는 기록 큐 초과가 발생하면 수집·CAN 조작을 중단하고, 진행 중이거나 저장이 확정되지 않은 시험을 `INCONCLUSIVE / RECORDING_FAILED`로 표시합니다. TCP 조회는 종료 신호까지 유지합니다. `dropped_records`는 미기록이 확인된 건수이고 `unconfirmed_records`는 그보다 넓은 범위로 디스크 동기화 여부가 확인되지 않은 입력까지 포함합니다. 실패 기록은 가능한 경우 `recording-failure.json`에 남기며 서비스 재개에는 재시작이 필요합니다.
+
 ### 측정값과 REAL 운전 회차
 
 모의 입력 기록과 Jetson 수집 모두 다음 파일을 생성합니다.
