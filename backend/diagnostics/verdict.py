@@ -64,6 +64,8 @@ class Trial:
     gap_fault: Observation | None = None
     gap_fault_cleared: bool = False
     baseline_accepted: bool = False
+    arm_record_id: str | None = None
+    pending_reset_id: str | None = None
 
     def add_evidence(self, *ids):
         self.evidence.update(dict.fromkeys(ids))

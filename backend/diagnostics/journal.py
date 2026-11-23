@@ -1,6 +1,7 @@
 """시험 원본과 결과를 저장하고 원본 입력 순서로 재현한다."""
 
 import json
+import logging
 import os
 from contextlib import ExitStack
 from dataclasses import asdict, fields
@@ -21,6 +22,7 @@ UTC_ZONE = timezone(timedelta(0))
 JOURNALS = ("inputs.jsonl", "raw_can.jsonl", "raw_fpga.jsonl", "events.jsonl")
 MEASUREMENTS = ("samples.csv", "operations.jsonl")
 FLUSH_INTERVAL_NS = 1_000_000_000
+LOGGER = logging.getLogger(__name__)
 
 
 def utc_now():
@@ -151,12 +153,22 @@ class Journal:
             raise
 
     def __exit__(self, exc_type, exc, traceback):
+        active_error = exc
         try:
             if exc_type is None:
                 for file in self.files.values():
                     sync(file)
+        except BaseException as sync_error:
+            active_error = sync_error
+            raise
         finally:
-            self._stack.close()
+            try:
+                self._stack.close()
+            except OSError as close_error:
+                if active_error is None:
+                    raise
+                LOGGER.warning("기록 파일 닫기 실패: %s", close_error)
+
         if exc_type is None:
             if self._needs_finish:
                 raise ValueError("기록 종료 처리가 완료되지 않았습니다")
@@ -233,6 +245,18 @@ class Journal:
                         "motor_boot": message_motor_boot(received.message),
                         "decode_error": received.error,
                         **gap,
+                    }
+                )
+            )
+        elif row["source"] == "can_tx":
+            self.files["raw_can.jsonl"].write(
+                json_line(
+                    {
+                        **row,
+                        "interface": self.manifest.get("hardware", {}).get(
+                            "can_interface"
+                        ),
+                        "motor_boot": message_motor_boot(received),
                     }
                 )
             )

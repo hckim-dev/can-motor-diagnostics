@@ -1,10 +1,29 @@
 """같은 입력 순서에서 CAN과 UART 증거를 시험 회차에 연결한다."""
 
+from dataclasses import dataclass, replace
 from uuid import UUID, uuid5
 
-from ..can_rx.codec import SUPPLY_PRESENT, SUPPLY_VALID, CanId, Mode, State
+from ..can_control.wire import Opcode
+from ..can_rx.codec import (
+    SUPPLY_PRESENT,
+    SUPPLY_VALID,
+    CanId,
+    Command,
+    CommandResult,
+    Mode,
+    Permit,
+    State,
+    decode_frame,
+)
 from ..can_rx.samples import SampleAssembler
-from ..can_rx.state import FAULT_LIFETIME, NC2_OPEN, STATE_LIFETIME, CanReceiver, fresh
+from ..can_rx.state import (
+    FAULT_LIFETIME,
+    NC2_OPEN,
+    STATE_LIFETIME,
+    STOP_REQUESTED,
+    CanReceiver,
+    fresh,
+)
 from ..fpga_uart.codec import DIAG_HIGH, READY_HIGH, TIMING_VALID, EventType, Phase
 from ..fpga_uart.session import STATUS_LIFETIME_NS, Issue, RunStatus, UartReceiver
 from .inputs import Input
@@ -18,6 +37,14 @@ from .verdict import (
 )
 
 CONTROL_FRAMES = {CanId.MOTOR_HELLO, CanId.MOTOR_STATE, CanId.MOTOR_FAULT}
+
+
+@dataclass(frozen=True)
+class ArmEvidence:
+    epoch: int
+    cmd_seq: int
+    record_ids: tuple[str, ...]
+    failed: bool = False
 
 
 class DiagnosticEngine:
@@ -51,6 +78,8 @@ class DiagnosticEngine:
         self.results = []
         self.latest_result = None
         self.can_socket_drops = 0
+        self.sent_command = None
+        self.arm_evidence = None
 
     def _next_acquisition(self):
         self._can_generation += 1
@@ -108,6 +137,8 @@ class DiagnosticEngine:
         observations = None
         if record.source == "can":
             observations = self._receive_can(record)
+        elif record.source == "can_tx":
+            observations = self._receive_submission(record)
         elif record.source == "fpga":
             observations = self.uart.feed(
                 record.payload, now, record_id=record.record_id
@@ -127,6 +158,8 @@ class DiagnosticEngine:
         received = self.can.ingest(
             record.payload, self.now_ns, ingest_seq=record.ingest_seq
         )
+        if isinstance(received.message, CommandResult) and record.detail:
+            self._receive_command_result(record, received.message)
         trial = self.trial
         if (
             trial is None
@@ -151,6 +184,79 @@ class DiagnosticEngine:
         elif received is self.can.state or received is self.can.fault:
             self._apply_can_evidence(trial, received)
         return received
+
+    def _receive_submission(self, record):
+        message = decode_frame(record.payload)
+        if record.detail is None:
+            return message
+
+        trial = self.trial
+        stop = isinstance(message, Permit) and message.flags & STOP_REQUESTED
+        if isinstance(message, Command):
+            self.sent_command = record, message
+            self.arm_evidence = (
+                ArmEvidence(message.epoch, message.cmd_seq, (record.record_id,))
+                if message.opcode == Opcode.ARM_TEST
+                else None
+            )
+            stop = message.opcode == Opcode.STOP
+        elif stop:
+            self.arm_evidence = None
+
+        reset = isinstance(message, Command) and message.opcode == Opcode.RESET
+        if (stop or reset) and (
+            trial is not None and message.epoch >> 16 == trial.motor_boot
+        ):
+            trial.add_evidence(record.record_id)
+            if trial.end_ns is not None:
+                trial.control_after_end = True
+            elif stop:
+                self._mark_control_change(trial, "STOP")
+            else:
+                if trial.pending_reset_id is not None:
+                    trial.add_issue("RESET_OUTCOME_UNKNOWN")
+                trial.pending_reset_id = record.record_id
+        return message
+
+    def _receive_command_result(self, result, message):
+        if self.sent_command is None:
+            return
+        submitted, command = self.sent_command
+        if (
+            result.detail["request_id"] != submitted.detail["request_id"]
+            or result.detail["opcode"] != Opcode(command.opcode).name
+            or (message.request_epoch, message.cmd_seq)
+            != (command.epoch, command.cmd_seq)
+        ):
+            return
+
+        completed = message.result == 1
+        failed = message.result not in (0, 1)
+        if command.opcode == Opcode.ARM_TEST and self.arm_evidence is not None:
+            self.arm_evidence = replace(
+                self.arm_evidence,
+                record_ids=(*self.arm_evidence.record_ids, result.record_id),
+                failed=failed,
+            )
+
+        trial = self.trial
+        if trial is not None and submitted.record_id in trial.evidence:
+            trial.add_evidence(result.record_id)
+            if failed and trial.arm_record_id == submitted.record_id:
+                trial.add_issue("ARM_TEST_RESULT_CONFLICT")
+            matches_pending_reset = trial.pending_reset_id == submitted.record_id
+            if matches_pending_reset and message.result != 0:
+                trial.pending_reset_id = None
+            if matches_pending_reset and completed:
+                if trial.terminal == RunStatus.END_RECEIVED:
+                    trial.add_issue("RESET_TIMING_UNCONFIRMED")
+                self._mark_control_change(trial, "RESET")
+                if not trial.control_after_end:
+                    trial.interrupted_by = "RESET"
+                    self._close(self.now_ns)
+
+        if message.result != 0:
+            self.sent_command = None
 
     def _apply_can_evidence(self, trial, received):
         trial.add_evidence(received.record_id)
@@ -250,6 +356,16 @@ class DiagnosticEngine:
             self.can.hello.record_id, trial.state.record_id, trial.fault.record_id
         )
         state = trial.state.message
+        if arm := self.arm_evidence:
+            if state.state == State.TEST_ARMED and (
+                state.epoch,
+                state.last_cmd_seq,
+            ) == (arm.epoch, arm.cmd_seq):
+                trial.add_evidence(*arm.record_ids)
+                trial.arm_record_id = arm.record_ids[0]
+                if arm.failed:
+                    trial.add_issue("ARM_TEST_RESULT_CONFLICT")
+            self.arm_evidence = None
         if (
             not corroborated(trial.state, trial.fault)
             or state.state != State.TEST_ARMED
@@ -376,6 +492,7 @@ class DiagnosticEngine:
             self.can_socket_drops += record.detail["dropped"]
         if event in ("can_disconnect", "can_rx_overflow"):
             self.can.disconnect(self.now_ns)
+            self.sent_command = self.arm_evidence = None
         if event in ("fpga_disconnect", "fpga_reconnect"):
             if trial is not None and record.detail is not None:
                 trial.add_evidence(*self.uart.pending_record_ids)
@@ -409,6 +526,11 @@ class DiagnosticEngine:
     def _close(self, end_ns):
         trial = self.trial
         if trial is not None:
+            if (
+                trial.pending_reset_id is not None
+                and trial.terminal == RunStatus.END_RECEIVED
+            ):
+                trial.add_issue("RESET_OUTCOME_UNKNOWN")
             if trial.end_ns is not None and self.uart.has_pending_frame:
                 self._mark_pending_uart(trial)
             self.latest_result = result_context(trial, self.config, end_ns)

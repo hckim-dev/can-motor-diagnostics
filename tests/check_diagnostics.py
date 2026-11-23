@@ -5,12 +5,14 @@ import os
 import tempfile
 import unittest
 from binascii import crc_hqx
+from contextlib import nullcontext
 from pathlib import Path
 from stat import S_ISDIR
 from struct import pack
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import UUID
 
+from backend.can_control.wire import Opcode, encode_command
 from backend.can_rx.codec import CanId, State
 from backend.diagnostics.engine import DiagnosticEngine
 from backend.diagnostics.inputs import Input
@@ -326,6 +328,164 @@ class VerdictTest(unittest.TestCase):
                 (confirmed,) = run_engine([*rows[:-1], *late, control, rows[-1]])
                 self.assertEqual(confirmed["result"], "PASS")
 
+    def test_reset_submission_after_end_excludes_later_fault_before_result(self):
+        rows = scenario_rows(fault=0)
+        frame = encode_command(EPOCH, 1, Opcode.RESET, 0)
+        reset = {
+            **can(2050, frame.can_id, frame.data),
+            "source": "can_tx",
+            "detail": {"request_id": SESSION},
+        }
+        late = status(2100, State.FAULT, epoch=EPOCH + 1, mask=4)
+        (result,) = run_engine([*rows[:-1], reset, *late, rows[-1]])
+        self.assertEqual(
+            (result["result"], result["reason"]),
+            ("INCONCLUSIVE", "CONTROL_CHANGED_BEFORE_FAULT_CONFIRMATION"),
+        )
+        self.assertIn(f"{SESSION}:{len(rows)}", result["evidence_ids"])
+        self.assertNotIn(f"{SESSION}:{len(rows) + 2}", result["evidence_ids"])
+
+    def test_reset_straddling_end_keeps_both_records_and_blocks_pass(self):
+        rows = scenario_rows()
+        frame = encode_command(EPOCH + 1, 1, Opcode.RESET, 0)
+        reset = {
+            **can(1900, frame.can_id, frame.data),
+            "source": "can_tx",
+            "detail": {"request_id": SESSION},
+        }
+        reply = {
+            **can(
+                2050,
+                CanId.COMMAND_RESULT,
+                pack("<IBBBB", EPOCH + 1, 1, 1, 0, State.STOPPED),
+            ),
+            "detail": {"request_id": SESSION, "opcode": "RESET"},
+        }
+        index = next(
+            i for i, row in enumerate(rows) if int(row["rx_mono_ns"]) >= 2000 * MS
+        )
+        inputs = [*rows[:index], reset, *rows[index:-1], reply, rows[-1]]
+        (result,) = run_engine(inputs)
+        self.assertEqual(
+            (result["result"], result["reason"]),
+            ("INCONCLUSIVE", "RESET_TIMING_UNCONFIRMED"),
+        )
+        self.assertIn(f"{SESSION}:{index + 1}", result["evidence_ids"])
+        self.assertIn(f"{SESSION}:{len(inputs) - 1}", result["evidence_ids"])
+
+        (missing_result,) = run_engine([*inputs[:-2], inputs[-1]])
+        self.assertEqual(
+            (missing_result["result"], missing_result["reason"]),
+            ("INCONCLUSIVE", "RESET_OUTCOME_UNKNOWN"),
+        )
+
+    def test_control_submitted_after_abort_does_not_explain_the_abort(self):
+        prefix = [*scenario_rows()[:5], uart(10, 2, 6, 3)]
+        for opcode in (Opcode.STOP, Opcode.RESET):
+            with self.subTest(opcode=opcode):
+                frame = encode_command(EPOCH, 1, opcode, 0)
+                control = {
+                    **can(20, frame.can_id, frame.data),
+                    "source": "can_tx",
+                    "detail": {"request_id": SESSION},
+                }
+                reply = {
+                    **can(
+                        30,
+                        CanId.COMMAND_RESULT,
+                        pack("<IBBBB", EPOCH, 1, 1, 0, State.STOPPED),
+                    ),
+                    "detail": {"request_id": SESSION, "opcode": opcode.name},
+                }
+                (result,) = run_engine([*prefix, control, reply, service(510)])
+                self.assertEqual(result["result"], "INCONCLUSIVE")
+
+    def test_arm_evidence_requires_matching_armed_state_sequence(self):
+        frame = encode_command(EPOCH, 2, Opcode.ARM_TEST, 0)
+        arm = {
+            **can(0, frame.can_id, frame.data),
+            "source": "can_tx",
+            "detail": {"request_id": SESSION},
+        }
+        reply = {
+            **can(
+                0,
+                CanId.COMMAND_RESULT,
+                pack("<IBBBB", EPOCH, 2, 1, 0, State.TEST_ARMED),
+            ),
+            "detail": {"request_id": SESSION, "opcode": "ARM_TEST"},
+        }
+        for last_cmd_seq in (1, 2):
+            with self.subTest(last_cmd_seq=last_cmd_seq):
+                rows = scenario_rows(1, latency=None, fault=0)
+                rows[1] = can(
+                    0,
+                    CanId.MOTOR_STATE,
+                    pack("<IBBBB", EPOCH, State.TEST_ARMED, 2, 0x04, last_cmd_seq),
+                )
+                (result,) = run_engine([arm, reply, *rows])
+                self.assertEqual(result["result"], "PASS")
+                for index in (1, 2):
+                    self.assertEqual(
+                        f"{SESSION}:{index}" in result["evidence_ids"],
+                        last_cmd_seq == 2,
+                    )
+
+    def test_failed_arm_result_conflicts_with_matching_armed_state(self):
+        frame = encode_command(EPOCH, 2, Opcode.ARM_TEST, 0)
+        arm = {
+            **can(0, frame.can_id, frame.data),
+            "source": "can_tx",
+            "detail": {"request_id": SESSION},
+        }
+        for before_baseline in (True, False):
+            with self.subTest(before_baseline=before_baseline):
+                rows = scenario_rows(1, latency=None, fault=0)
+                rows[1] = can(
+                    0,
+                    CanId.MOTOR_STATE,
+                    pack("<IBBBB", EPOCH, State.TEST_ARMED, 2, 0x04, 2),
+                )
+                reply = {
+                    **can(
+                        0,
+                        CanId.COMMAND_RESULT,
+                        pack("<IBBBB", EPOCH, 2, 3, 5, State.STOPPED),
+                    ),
+                    "detail": {"request_id": SESSION, "opcode": "ARM_TEST"},
+                }
+                position = 3 if before_baseline else 5
+                rows.insert(position, reply)
+                (result,) = run_engine([arm, *rows])
+                self.assertEqual(
+                    (result["result"], result["reason"]),
+                    ("INCONCLUSIVE", "ARM_TEST_RESULT_CONFLICT"),
+                )
+                self.assertIn(f"{SESSION}:{position + 2}", result["evidence_ids"])
+
+    def test_new_arm_during_end_window_is_not_evidence_for_previous_trial(self):
+        rows = scenario_rows(1, latency=None, fault=0)
+        frame = encode_command(EPOCH, 2, Opcode.ARM_TEST, 0)
+        arm = {
+            **can(3100, frame.can_id, frame.data),
+            "source": "can_tx",
+            "detail": {"request_id": SESSION},
+        }
+        reply = {
+            **can(
+                3100,
+                CanId.COMMAND_RESULT,
+                pack("<IBBBB", EPOCH, 2, 3, 5, State.STOPPED),
+            ),
+            "detail": {"request_id": SESSION, "opcode": "ARM_TEST"},
+        }
+        (result,) = run_engine([*rows[:-1], arm, reply, rows[-1]])
+        self.assertEqual(
+            (result["result"], result["reason"]), ("PASS", "NORMAL_CONFIRMED")
+        )
+        self.assertNotIn(f"{SESSION}:{len(rows)}", result["evidence_ids"])
+        self.assertNotIn(f"{SESSION}:{len(rows) + 1}", result["evidence_ids"])
+
     def test_can_estop_and_mode_change_cut_off_post_end_evidence(self):
         rows = scenario_rows(fault=0)
         late = status(2100, State.FAULT, epoch=EPOCH + 1, mask=4)
@@ -352,6 +512,26 @@ class VerdictTest(unittest.TestCase):
 
 
 class JournalTest(unittest.TestCase):
+    def test_close_failure_preserves_active_recording_error(self):
+        for error in (None, OSError("UART 수집 실패")):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "run"
+                close_error = OSError("기록 닫기 실패")
+                logs = (
+                    self.assertLogs("backend.diagnostics.journal", "WARNING")
+                    if error is not None
+                    else nullcontext()
+                )
+                with logs, self.assertRaises(OSError) as caught:
+                    with Journal(output, Config()) as journal:
+                        journal._stack.callback(Mock(side_effect=close_error))
+                        if error is not None:
+                            raise error
+
+                self.assertIs(caught.exception, error or close_error)
+                self.assertTrue(all(file.closed for file in journal.files.values()))
+                self.assertFalse((output / "manifest.json").exists())
+
     def test_failed_directory_sync_leaves_no_replayable_manifest(self):
         fsync = os.fsync
 

@@ -7,11 +7,13 @@ from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 
+from ..can_control.boot_id import boot_id_session
 from ..diagnostics.journal import Journal
 from ..diagnostics.verdict import Config
 from ..hardware.socketcan import open_can, read_can_observation
 from ..hardware.uart import open_uart, read_uart
 from ..tcp_stream import PORT, listen, shutdown_signal
+from .control import ControlFeed
 from .inputs import DeviceFeed, FixtureFeed
 from .service import Monitor
 
@@ -30,6 +32,10 @@ def main():
     parser.add_argument("--can", help="SocketCAN 수신 인터페이스")
     parser.add_argument("--uart", type=Path, help="FPGA 전용 tty 경로")
     parser.add_argument(
+        "--motor-power-off", action="store_true", help="전원 차단 CAN 조작 활성화"
+    )
+    parser.add_argument("--boot-id-file", type=Path, help="조작 노드 부팅 ID 파일")
+    parser.add_argument(
         "--gpio-verified", action="store_true", help="모의 GPIO 검증 전제"
     )
     parser.add_argument("--host", default="127.0.0.1")
@@ -41,6 +47,15 @@ def main():
         )
     if args.gpio_verified and not args.fixture:
         parser.error("--gpio-verified는 모의 입력에서만 사용할 수 있습니다")
+    if args.motor_power_off:
+        if not (args.can and args.uart and args.boot_id_file):
+            parser.error(
+                "전원 차단 조작에는 --can, --uart, --boot-id-file이 필요합니다"
+            )
+        if args.host != "127.0.0.1":
+            parser.error("전원 차단 조작은 127.0.0.1에서만 실행할 수 있습니다")
+    elif args.boot_id_file:
+        parser.error("--boot-id-file에는 --motor-power-off가 필요합니다")
 
     config = Config(gpio_verified=args.gpio_verified, functional_only=not args.fixture)
     try:
@@ -54,6 +69,9 @@ def main():
                     "fpga_uart": str(args.uart) if args.uart else None,
                     "fpga_status_watchdog": bool(args.uart),
                 }
+            if args.motor_power_off:
+                boot_id = stack.enter_context(boot_id_session(args.boot_id_file))
+                hardware["operator_boot_id"] = boot_id
             journal = stack.enter_context(
                 Journal(args.output, config, hardware=hardware)
             )
@@ -65,7 +83,7 @@ def main():
                     {"can": read_can_observation, "fpga": read_uart},
                     can_open=(
                         partial(open_can, args.can, count_overflow=True)
-                        if args.can
+                        if args.can and not args.motor_power_off
                         else None
                     ),
                     fpga_open=(
@@ -75,6 +93,12 @@ def main():
                     ),
                 )
             )
+            if args.motor_power_off:
+                feed = ControlFeed(
+                    partial(open_can, args.can, count_overflow=True, receive_own=True),
+                    feed,
+                    boot_id,
+                )
             asyncio.run(serve(journal, config, feed, args.host, args.port))
     except (
         OSError,

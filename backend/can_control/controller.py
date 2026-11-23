@@ -98,6 +98,7 @@ class CanController:
         rpm_max=MAX_TARGET_RPM,
         *,
         power_off_test=False,
+        on_submission=None,
     ):
         if not 1 <= rpm_max <= MAX_TARGET_RPM:
             raise ValueError("최대 RPM 범위 오류")
@@ -106,6 +107,8 @@ class CanController:
         self.operator_hello = encode_operator_hello(boot_id)
         self.rpm_max = rpm_max
         self.power_off_test = power_off_test
+        self.on_submission = on_submission
+        self.stop_request_id = None
         self.next_hello_ns = 0
         self.operator_announced = False
         self.can_connected = True
@@ -229,6 +232,8 @@ class CanController:
     def start_inhibit(self, reason, *, renew=False):
         if self.inhibit is None or renew:
             self.inhibit = InhibitRequest(self.epoch)
+        if renew:
+            self.stop_request_id = None
         self.next_permit_ns = 0
         self.permit_sent_ns = None
         if self.pending is not None and (renew or self.pending.opcode != Opcode.STOP):
@@ -275,6 +280,9 @@ class CanController:
             self.next_permit_ns = now_ns + PERMIT_PERIOD_NS
         if not sent:
             return
+        if self.on_submission is not None:
+            self.on_submission(frame, now_ns, self.stop_request_id)
+        self.stop_request_id = None
         self.alive_seq = (self.alive_seq + 1) & SEQUENCE_MASK
         if self.inhibit is not None:
             # 수신 대기열이 남으면 그 안의 STATE로 억제를 확인할 수 없다.
@@ -294,6 +302,8 @@ class CanController:
 
         if now_ns >= self.next_hello_ns:
             sent = self.try_send(self.operator_hello)
+            if sent and self.on_submission is not None:
+                self.on_submission(self.operator_hello, now_ns, None)
             self.operator_announced |= sent
             self.next_hello_ns = now_ns + (
                 HELLO_PERIOD_NS if sent else PERMIT_PERIOD_NS
@@ -319,6 +329,8 @@ class CanController:
         )
         if self.try_send(frame):
             pending.sent_ns = now_ns
+            if self.on_submission is not None:
+                self.on_submission(frame, now_ns, pending.request_id)
 
     def request(self, request_id, opcode, argument, now_ns):
         """명령을 대기 상태로 등록하고 실제 송신은 poll에서 처리한다."""
@@ -329,7 +341,10 @@ class CanController:
             return Outcome(request_id, "REJECTED", "POWER_OFF_TEST_ONLY")
         if opcode == Opcode.STOP:
             self.start_inhibit("CANCELLED_BY_STOP", renew=True)
-            if not self.receiver.motor_known(now_ns) or self.cmd_seq >= MAX_CMD_SEQ:
+            if not self.receiver.motor_known(now_ns):
+                return Outcome(request_id, "UNKNOWN_OUTCOME", "STOP_INHIBIT_ONLY")
+            self.stop_request_id = request_id
+            if self.cmd_seq >= MAX_CMD_SEQ:
                 return Outcome(request_id, "UNKNOWN_OUTCOME", "STOP_INHIBIT_ONLY")
         else:
             reason = self.rejection_reason(opcode, argument, now_ns)
@@ -390,7 +405,7 @@ class CanController:
             return "NOT_CONFIGURED"
         return None if argument <= self.rpm_max else "BAD_ARGUMENT"
 
-    def receive(self, frame, now_ns):
+    def receive(self, frame, now_ns, *, on_result=None):
         self.advance_time(now_ns)
         if not self.can_connected:
             return None
@@ -417,8 +432,12 @@ class CanController:
                         pending.request_id, status, reason, pending.epoch, pending.seq
                     )
                 )
+            else:
+                return received
         else:
             self.complete(status, reason)
+        if on_result is not None:
+            on_result(pending.request_id, pending.opcode)
         return received
 
     def cancel_pending(self, reason):

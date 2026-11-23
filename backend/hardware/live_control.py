@@ -13,6 +13,7 @@ from ..tcp_stream import run_tcp_server
 from .socketcan import (
     CAN_ERR_BUSOFF,
     CanDropCounter,
+    can_error_reason,
     open_can,
     pack_frame,
     read_can_observation,
@@ -25,13 +26,37 @@ SEND_BUSY = {errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS}
 
 
 class SocketCanControl:
-    def __init__(self, opener, *, now_ns=time.monotonic_ns):
+    def __init__(self, opener, *, now_ns=time.monotonic_ns, record=None):
         self.opener = opener
         self.now_ns = now_ns
         self.socket = None
         self.retry_at_ns = 0
         self.drops = CanDropCounter()
         self.send_error = None
+        self.record = record
+        self.open_attempt = 0
+
+    def note(self, now, source, payload, **detail):
+        if self.record is not None:
+            self.record((now, source, payload, detail or None))
+
+    def submitted(self, frame, now, request_id):
+        detail = {"request_id": request_id} if request_id is not None else {}
+        self.note(now, "can_tx", frame, **detail)
+
+    def receive(self, controller, frame):
+        now = self.now_ns()
+        if self.record is None:
+            controller.receive(frame, now)
+            return
+
+        detail = {}
+
+        def match(request_id, opcode):
+            detail.update(request_id=request_id, opcode=opcode.name)
+
+        controller.receive(frame, now, on_result=match)
+        self.note(now, "can", frame, **detail)
 
     def try_send(self, frame):
         if self.socket is None or self.send_error is not None:
@@ -52,7 +77,7 @@ class SocketCanControl:
             sock, self.socket = self.socket, None
             sock.close()
 
-    def lose_link(self, controller, error, *, submit_inhibit=False):
+    def lose_link(self, controller, error, *, reason=None, submit_inhibit=False):
         now = self.now_ns()
         controller.disconnect_can(now)
         controller.disconnect_client(now)
@@ -63,6 +88,13 @@ class SocketCanControl:
             self.close_socket()
         self.send_error = None
         self.retry_at_ns = now + RETRY_NS
+        self.open_attempt = 0
+        self.note(
+            now,
+            "service",
+            "can_disconnect",
+            reason=reason or can_error_reason(error),
+        )
         LOGGER.warning("CAN 조작 연결 중단: %s", error)
 
     def step(self, controller):
@@ -71,15 +103,33 @@ class SocketCanControl:
             controller.advance_time(now)
             if now < self.retry_at_ns:
                 return
+            attempt = self.open_attempt + 1 if self.retry_at_ns else 0
             try:
                 self.socket = self.opener()
             except (OSError, ValueError) as exc:
-                self.lose_link(controller, exc)
+                reason = can_error_reason(exc, invalid="INVALID_INTERFACE")
+                if attempt:
+                    self.open_attempt = attempt
+                    self.retry_at_ns = now + RETRY_NS
+                    self.note(
+                        now,
+                        "service",
+                        "can_retry_failed",
+                        attempt=attempt,
+                        reason=reason,
+                    )
+                    LOGGER.warning("CAN 조작 재연결 실패: %s", exc)
+                else:
+                    self.lose_link(controller, exc, reason=reason)
                 return
             self.drops = CanDropCounter()
             now = self.now_ns()
             controller.disconnect_client(now)
             controller.reconnect_can(now)
+            if attempt:
+                self.note(now, "service", "can_reconnect", attempt=attempt)
+            self.retry_at_ns = 0
+            self.open_attempt = 0
 
         # 송신 전에 대기 중인 STATE를 먼저 읽는다.
         for _ in range(MAX_RX_PER_POLL):
@@ -96,7 +146,8 @@ class SocketCanControl:
                 return
 
             frame = received.frame
-            if self.drops.observe(received.dropped_total):
+            if drop := self.drops.observe(received.dropped_total):
+                self.note(self.now_ns(), "service", "can_rx_overflow", dropped=drop)
                 self.lose_link(controller, "수신 큐 드롭", submit_inhibit=True)
                 return
             if received.error is not None:
@@ -104,9 +155,10 @@ class SocketCanControl:
                 return
             if frame is not None:
                 if frame.error and frame.can_id & CAN_ERR_BUSOFF:
-                    self.lose_link(controller, "bus-off")
+                    self.note(self.now_ns(), "can", frame)
+                    self.lose_link(controller, "bus-off", reason="BUS_OFF")
                     return
-                controller.receive(frame, self.now_ns())
+                self.receive(controller, frame)
         else:
             now = self.now_ns()
             controller.advance_time(now)
@@ -116,7 +168,7 @@ class SocketCanControl:
             self.lose_link(controller, self.send_error)
 
     async def run(self, stream):
-        controller = stream.controller
+        controller = stream.control.controller
         try:
             while True:
                 self.step(controller)
@@ -127,9 +179,12 @@ class SocketCanControl:
             try:
                 if self.socket is not None:
                     now = self.now_ns()
-                    controller.disconnect_client(now)
-                    controller.start_inhibit("CANCELLED_BY_SHUTDOWN", renew=True)
-                    controller.send_permit(now)
+                    try:
+                        controller.disconnect_client(now)
+                        controller.start_inhibit("CANCELLED_BY_SHUTDOWN", renew=True)
+                        controller.send_permit(now)
+                    finally:
+                        controller.disconnect_can(now)
             finally:
                 self.close_socket()
 

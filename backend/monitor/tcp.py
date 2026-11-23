@@ -85,13 +85,25 @@ class ReadOnlySession:
 
 class MonitorStream(TcpStream):
     capabilities = ("diagnostics_read_only",)
-    open_session = staticmethod(ReadOnlySession)
 
     def __init__(self, session, source, initial):
         super().__init__(session)
         self.source = source
         self.latest = initial
         self.events = deque()
+
+    def open_session(self, stream_id):
+        if self.control is not None:
+            return self.control.open_session(stream_id)
+        return ReadOnlySession(stream_id)
+
+    def pending_results(self, session):
+        return self.control.drain(session.stream_id) if self.control is not None else ()
+
+    def client_disconnected(self, session):
+        if self.control is not None:
+            self.control.controller.disconnect_client(time.monotonic_ns())
+            self.control.drain()
 
     def snapshot(self, session, now):
         return self.latest.at(time.monotonic_ns())

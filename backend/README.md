@@ -12,7 +12,7 @@ python3 -m compileall -q backend tests
 git diff --check
 ```
 
-자동 테스트는 TCP 조작, 모의 CAN, 가상 시리얼 포트의 UART 수신·복구, 판정·기록·리플레이와 통합 서비스를 검증합니다. 읽기 전용 TCP의 메시지 순서·전송 주기·재접속은 아래 독립 클라이언트로 확인합니다. 실물 수신·송신은 [Jetson 실물 연결 확인](#jetson-실물-연결-확인)의 절차를 따릅니다.
+자동 테스트는 TCP 조작, 모의 CAN, 가상 시리얼 포트의 UART 수신·복구, 판정·기록·리플레이와 통합 서비스를 검증합니다. 9c는 가상 데이터그램 소켓에서 명령·허가 송신, STOP 선점, 전원 차단 조건과 장애 복구를 검증합니다. 읽기 전용 TCP의 메시지 순서·전송 주기·재접속은 아래 독립 클라이언트로 확인합니다. 실물 수신·송신은 [Jetson 실물 연결 확인](#jetson-실물-연결-확인)의 절차를 따릅니다.
 
 ## TCP·CAN 목업
 
@@ -112,19 +112,35 @@ python3 -m backend.monitor .local/monitor-run \
   --fixture tests/fixtures/diagnostic-no-edge.jsonl --gpio-verified
 ```
 
-클라이언트는 기본 `127.0.0.1:5000`에서 `hello → snapshot`을 받고 약 10Hz로 상태를 수신합니다. 판정을 디스크에 저장한 뒤 `event`를 보내며, TCP `event_id`로 `events.jsonl`의 전체 증거를 찾을 수 있습니다. 재접속하면 새 스트림에서 최근 상태와 판정을 받습니다. 명령 요청은 `READ_ONLY`로 응답합니다.
+클라이언트는 기본 `127.0.0.1:5000`에서 `hello → snapshot`을 받고 약 10Hz로 상태를 수신합니다. 판정을 디스크에 저장한 뒤 `event`를 보내며, TCP `event_id`로 `events.jsonl`의 전체 증거를 찾을 수 있습니다. 재접속하면 새 스트림에서 최근 상태와 판정을 받습니다. 기본 관측 모드의 명령 요청은 `READ_ONLY`로 응답합니다.
 
 저장이 지연되어도 각 TCP 송신 시점의 상태·허가·측정값 유효 기간을 적용합니다.
 
 예제는 원본 시각 간격을 따라 입력을 공급하며, 끝까지 처리한 뒤에도 TCP 관측을 유지합니다. 장치가 단절되면 해당 입력을 `OFFLINE`으로 표시하고 다른 입력과 TCP 관측을 계속합니다. Ctrl+C 또는 SIGTERM으로 종료하면 관측한 입력까지만 마감하고, 정상적으로 동기화한 뒤 `manifest.json`을 게시합니다.
 
-장비를 연결한 환경에서는 `--can "$CAN_IFACE" --uart "$FPGA_TTY"`로 수신 전용 관측을 실행할 수 있습니다. 실물 수신에서 시험은 기능 관측으로 기록합니다. 이 서비스의 자체 CAN 송신은 없습니다. 장치 준비 방법은 아래 절을 참조합니다.
+장비를 연결한 환경에서는 `--can "$CAN_IFACE" --uart "$FPGA_TTY"`로 수신 전용 관측을 실행할 수 있습니다. 실물 수신에서 시험은 기능 관측으로 기록합니다. 기본 관측 모드는 CAN을 수신합니다. 장치 준비 방법은 아래 절을 참조합니다.
 
 CAN 소켓이 열리지 않거나 bus-off·소켓 오류로 단절되면, 직전 실패 또는 단절 후 1초, 2초, 4초 간격으로 최대 세 번 새 소켓을 엽니다. 호환 `MOTOR_HELLO`와 같은 epoch의 새 `MOTOR_STATE`를 받아야 `OK`로 돌아옵니다. 최신 모터 상태가 60초 동안 연속 관측되면 재시도 한도가 초기화됩니다. 재시도를 소진하면 서비스를 재시작해 다시 시도할 수 있습니다. Backend는 CAN 인터페이스 설정과 컨트롤러 재시작을 운영체제에 맡깁니다.
 
 FPGA UART도 포트 열기 실패나 연결 종료 후 같은 경로를 최대 세 번 다시 엽니다. CAN과 UART의 재시도 한도는 독립적입니다. `/dev/serial/by-id/...`를 사용하면 같은 장치의 tty 번호가 바뀌어도 사라진 링크가 복구된 뒤 재등록할 수 있습니다. 포트를 열 때 읽지 않은 입력을 비우고, 재등록 시 새 FPGA 세션에서 CRC가 유효한 `STATUS`를 기다립니다. 정상 STATUS가 60초 동안 연속 관측되면 UART 재시도 한도를 초기화합니다.
 
 실물 수신에서 진행 중인 시험에 유효한 `STATUS`가 500ms 동안 없으면 `INCONCLUSIVE`로 마감하며, 리플레이는 기록 당시와 같은 감시 설정을 사용합니다. 순번이나 보드 시각이 역행해 격리된 세션은 포트 재연결이나 서비스 재시작으로 복구합니다.
+
+### 전원 차단 조작과 진단 기록 통합
+
+모터 6V 전원이 차단된 환경에서 CAN 조작과 UART 진단을 한 TCP 연결로 확인할 수 있습니다.
+
+```sh
+python3 -m backend.monitor .local/control-run \
+  --can "$CAN_IFACE" --uart "$FPGA_TTY" \
+  --motor-power-off --boot-id-file .local/jetson-operator-boot-id
+```
+
+로컬 클라이언트는 같은 `stream_id`에서 `control_result`, `snapshot`, 판정 `event`를 받습니다. 조작은 TEST 모드와 공급 차단 확인을 적용하며 `START_REAL`을 거부합니다. 단독 `can-control`과 같은 부팅 ID 파일을 사용합니다. 실물 입력의 GPIO 시간 판정에는 기존 기능 관측 제한을 적용합니다.
+
+`inputs.jsonl`과 `raw_can.jsonl`의 `source=can_tx`는 소켓 제출을 나타냅니다. CAN 명령과 제어기가 매칭한 MCU 응답을 `detail.request_id`로 연결하고, 시험 판정의 `evidence_ids`가 관련 프레임을 참조합니다. 같은 명령의 `TEST_ARMED` 상태와 실패 응답이 함께 관측되면 `INCONCLUSIVE`로 기록합니다. STOP은 제어기가 제출한 억제·명령을, RESET은 MCU 완료 응답을 중단 판정에 사용합니다. `END` 전에 제출한 RESET의 완료 응답이 `END` 뒤에 오거나 판정 마감까지 결과가 없으면 `INCONCLUSIVE`로 기록합니다. 원본을 리플레이하면 입력 순서와 판정 근거가 재현됩니다.
+
+수집 작업의 예외로 서비스가 중단되면 판정에 넘기기 전인 입력과 큐에 남은 원본을 `inputs.jsonl`에 순서대로 저장합니다. 이때 추가 판정과 완료 표시인 `manifest.json`의 생성은 생략합니다.
 
 ## Jetson 실물 연결 확인
 

@@ -2,7 +2,8 @@
 
 from dataclasses import dataclass
 
-from ..can_rx.codec import Frame
+from ..can_control.wire import Opcode
+from ..can_rx.codec import CanId, Frame
 
 SERVICES = {
     "clock",
@@ -51,7 +52,7 @@ class Input:
             or not raw_time.isdecimal()
         ):
             raise ValueError("rx_mono_ns는 음이 아닌 정수 문자열이어야 한다")
-        if source == "can":
+        if source in ("can", "can_tx"):
             can_id, dlc = row["can_id"], row["dlc"]
             if type(can_id) is not int or type(dlc) is not int:
                 raise ValueError("CAN ID와 DLC는 정수여야 한다")
@@ -69,7 +70,29 @@ class Input:
             raise ValueError("지원하지 않는 판정 입력")
         detail = row.get("detail")
         if "detail" in row:
-            if (
+            if source in ("can", "can_tx"):
+                rx_result = source == "can" and can_id == CanId.COMMAND_RESULT
+                tx_command = source == "can_tx" and can_id in (
+                    CanId.COMMAND,
+                    CanId.OP_PERMIT,
+                )
+                fields = {"request_id", "opcode"} if rx_result else {"request_id"}
+                if (
+                    not (rx_result or tx_command)
+                    or not isinstance(detail, dict)
+                    or detail.keys() != fields
+                    or not isinstance(detail["request_id"], str)
+                    or not detail["request_id"]
+                    or (
+                        rx_result
+                        and (
+                            not isinstance(detail["opcode"], str)
+                            or detail["opcode"] not in Opcode.__members__
+                        )
+                    )
+                ):
+                    raise ValueError("CAN 조작 근거 형식 오류")
+            elif (
                 source != "service"
                 or not isinstance(detail, dict)
                 or detail.keys() != SERVICE_DETAIL_FIELDS.get(payload)
@@ -111,6 +134,8 @@ class Input:
                 rtr=self.payload.rtr,
                 error=self.payload.error,
             )
+            if self.detail is not None:
+                row["detail"] = self.detail
         elif isinstance(self.payload, bytes):
             row["hex"] = self.payload.hex(" ")
         else:

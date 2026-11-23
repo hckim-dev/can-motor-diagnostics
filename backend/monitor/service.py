@@ -1,12 +1,15 @@
-"""수신·판정·기록을 직렬 처리하고 TCP에 읽기 전용 상태를 게시한다."""
+"""수신·판정·기록을 직렬 처리하고 TCP에 상태를 게시한다."""
 
 import asyncio
+import logging
 import time
 
 from ..diagnostics.inputs import Input
 from ..diagnostics.journal import record_input
 from ..tcp_stream import SNAPSHOT_INTERVAL
 from .tcp import MonitorStream, MonitorView
+
+LOGGER = logging.getLogger(__name__)
 
 
 class Monitor:
@@ -23,6 +26,8 @@ class Monitor:
         self.stream = MonitorStream(
             journal.backend_session, journal.manifest["source"], self._view()
         )
+        if attach := getattr(feed, "attach_control", None):
+            attach(self.stream)
 
     def _remember_event(self, event):
         context = event["context"]
@@ -76,44 +81,62 @@ class Monitor:
         )
 
     def _consume(self, batch):
-        for now, source, payload, *detail in batch:
-            record = Input(
+        self._consume_records(batch)
+        return self._publication()
+
+    def _batch_inputs(self, batch):
+        for seq, (now, source, payload, *detail) in enumerate(
+            batch, self.engine.ingest_seq + 1
+        ):
+            yield Input(
                 self.journal.evidence_session,
-                self.engine.ingest_seq + 1,
+                seq,
                 now,
                 source,
                 payload,
                 *detail,
             )
+
+    def _consume_records(self, batch):
+        for record in self._batch_inputs(batch):
             received, _ = record_input(self.journal, self.engine, record)
-            if source == "fpga":
+            if record.source == "fpga":
                 for observation in received:
                     if observation.frame is not None and not observation.duplicate:
-                        self.fpga_last_ns = now
+                        self.fpga_last_ns = record.rx_mono_ns
                     if not observation.duplicate:
                         self.fpga_degraded = bool(observation.issues)
-            elif source == "service" and payload == "fpga_reconnect":
+            elif record.source == "service" and record.payload == "fpga_reconnect":
                 self.fpga_last_ns = None
                 self.fpga_degraded = False
-        return self._publication()
+
+    def _save_remaining_inputs(self, batch):
+        # 수집 장애로 중단된 기록에는 판정을 추가하지 않는다.
+        for record in self._batch_inputs(batch):
+            self.journal.input(record, None, None)
+        self.journal.flush()
 
     def _publication(self):
         snapshot = self._view()
         events, self.events = self.events, []
         return snapshot, events
 
-    def _finish(self):
+    def _finish(self, batch=()):
+        self._consume_records(batch)
         self.journal.finish(self.engine)
         return self._publication()
 
-    async def _publish_from(self, work, *args):
+    async def _write(self, work, *args):
         task = asyncio.create_task(asyncio.to_thread(work, *args))
         try:
-            snapshot, events = await asyncio.shield(task)
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
             # 쓰기 작업이 끝난 뒤에만 호출자가 파일을 닫을 수 있다.
             await task
             raise
+
+    async def _publish_from(self, work, *args):
+        snapshot, events = await self._write(work, *args)
         if self.observe_devices is not None:
             self.observe_devices(snapshot)
         self.stream.publish(snapshot, events)
@@ -121,7 +144,9 @@ class Monitor:
     async def run(self, stop):
         records = self.feed.records()
         read = None if stop.is_set() else asyncio.create_task(anext(records))
-        stopping = asyncio.create_task(stop.wait())
+        stopping = asyncio.create_task(self._watch_stop(stop))
+        active_error = None
+        failed_batch = ()
         try:
             while not stop.is_set() or (read is not None and read.done()):
                 waiting = (read, stopping) if read is not None else (stopping,)
@@ -139,6 +164,10 @@ class Monitor:
                         await self._publish_from(self._finish)
                         self.finished = True
                     else:
+                        if worker_error := getattr(self.feed, "worker_error", None):
+                            # 큐에서 꺼낸 입력도 판정 전에 수집 실패를 확인한다.
+                            failed_batch = batch
+                            raise worker_error
                         await self._publish_from(self._consume, batch)
                         if not stop.is_set():
                             read = asyncio.create_task(anext(records))
@@ -147,13 +176,45 @@ class Monitor:
                 else:
                     batch = () if self.finished else self.feed.idle_records()
                     await self._publish_from(self._consume, batch)
+        except BaseException as exc:
+            active_error = exc
+            raise
         finally:
             tasks = (read, stopping) if read is not None else (stopping,)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            await records.aclose()
+            await self._close_inputs(records, active_error, failed_batch)
 
         if not self.finished:
-            await self._publish_from(self._finish)
+            final_records = getattr(self.feed, "final_records", None)
+            if final_records is None:
+                await self._publish_from(self._finish)
+            else:
+                await self._publish_from(self._finish, final_records())
             self.finished = True
+
+    async def _close_inputs(self, records, active_error, failed_batch):
+        close_error = None
+        try:
+            await records.aclose()
+        except Exception as exc:
+            close_error = exc
+
+        worker_error = getattr(self.feed, "worker_error", None)
+        error = active_error or close_error or worker_error
+        if error is not None and error is worker_error:
+            try:
+                batch = (*failed_batch, *self.feed.final_records())
+                await self._write(self._save_remaining_inputs, batch)
+            except OSError as exc:
+                LOGGER.warning("수집 종료 시 남은 원본 저장 실패: %s", exc)
+        if close_error is not None and close_error is not error:
+            LOGGER.warning("수집 입력 종료 실패: %s", close_error)
+        if active_error is None and error is not None:
+            raise error
+
+    async def _watch_stop(self, stop):
+        await stop.wait()
+        if stop_inputs := getattr(self.feed, "stop_inputs", None):
+            stop_inputs()
