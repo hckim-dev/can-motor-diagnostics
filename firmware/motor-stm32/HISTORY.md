@@ -2,6 +2,13 @@
 
 의미 있는 작업을 마치면 [공통 양식](../../docs/development-history.md)에 따라 기록합니다.
 
+## 2026-11-24 · CAN 핀 확인 중 ST-LINK 연결 실패 점검
+
+- **담당·근거** — 권민지(모터 STM32), NUCLEO-F103RB의 전원 측정 및 ST-LINK 연결 시험, [`motor_mcu.ioc`](motor_mcu.ioc)와 [`stm32f1xx_hal_msp.c`](Core/Src/stm32f1xx_hal_msp.c) 설정 확인
+- **문제** — CAN 내부 루프백을 확인하려는 중 ST-LINK에서 `Target is not responding`과 레지스터 읽기 실패가 발생했다. 외부 브레드보드 배선을 분리한 상태에서도 연결 실패가 반복됐다.
+- **판단과 변경** — CubeMX 설정과 HAL 초기화 코드에서 CAN RX는 PA11(CN10-14), TX는 PA12(CN10-12)로 일치함을 확인했다. 전원 측정 위치를 옮겨 3.3V와 5V를 확인했지만 ST-LINK는 여전히 타깃을 인식하지 못했다. 타깃 연결 실패의 원인은 미확정이다.
+- **검증** — 로컬 ARM GCC 빌드와 링크가 완료되어 `motor_mcu.elf`가 생성됐다. 실물 보드의 CAN 내부 루프백과 외부 CAN 통신 검증은 미실행이다.
+
 ## 2026-11-20 · 방향 입력 해제에 따른 모터 정지 구조 설계
 
 - **담당·근거** — 권민지(모터 STM32), 기존 `Core/Src/motor_control.c`의 `start`·`stop` 분기와 앞·뒤 버튼 해제 동작에 대한 설계 논의
