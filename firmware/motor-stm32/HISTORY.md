@@ -2,12 +2,12 @@
 
 의미 있는 작업을 마치면 [공통 양식](../../docs/development-history.md)에 따라 기록합니다.
 
-## 2026-11-24 · CAN 핀 확인 중 ST-LINK 연결 실패 점검
+## 2026-11-24 · JP5 전원 선택 변경으로 ST-LINK 연결 복구
 
-- **담당·근거** — 권민지(모터 STM32), NUCLEO-F103RB의 전원 측정 및 ST-LINK 연결 시험, [`motor_mcu.ioc`](motor_mcu.ioc)와 [`stm32f1xx_hal_msp.c`](Core/Src/stm32f1xx_hal_msp.c) 설정 확인
-- **문제** — CAN 내부 루프백을 확인하려는 중 ST-LINK에서 `Target is not responding`과 레지스터 읽기 실패가 발생했다. 외부 브레드보드 배선을 분리한 상태에서도 연결 실패가 반복됐다.
-- **판단과 변경** — CubeMX 설정과 HAL 초기화 코드에서 CAN RX는 PA11(CN10-14), TX는 PA12(CN10-12)로 일치함을 확인했다. 전원 측정 위치를 옮겨 3.3V와 5V를 확인했다. 첫 점검에서는 ST-LINK 연결에 실패했고, 이후 담당자가 점검 중 문제가 해결됐다고 보고했다. 최신 CubeIDE 디버그 설정에서 SWD와 `Connect Under Reset`을 확인했다. 연결 실패 원인과 복구에 적용한 조치는 확인되지 않았다.
-- **검증** — 로컬 ARM GCC 빌드와 링크가 완료되어 `motor_mcu.elf`가 생성됐다. 복구 이후의 펌웨어 다운로드, 실물 CAN 내부 루프백 및 외부 CAN 통신 결과는 확인 자료가 없다.
+- **담당·근거** — 권민지(모터 STM32), [전원 측정 사진과 디버그 기록](https://app.notion.com/p/4224894796bd8180bb42f93f4f1d25f9), CubeProgrammer v2.16.0 로그, `motor_mcu.ioc`와 HAL 초기화 코드.
+- **문제** — CAN 내부 루프백 준비 중 `Target is not responding`과 레지스터 읽기 실패가 발생했다. 외부 브레드보드 배선을 빼도 실패가 반복됐다.
+- **판단과 변경** — CAN RX는 PA11(CN10-14), TX는 PA12(CN10-12)임을 확인했다. USB 입력 U5V는 5.14 V였으나 보드 5V는 약 2.07–2.09 V, 3V3는 2.06 V였다. USB로 전원을 공급하는 보드의 JP5 점퍼 캡을 U5V 위치로 옮겼다.
+- **검증** — 변경 후 오실로스코프에서 5V는 5.11 V, 3V3는 3.39 V로 측정됐다. ST-LINK 펌웨어 V2J44M29, SWD 4 MHz, Under Reset 조건에서 CubeProgrammer가 NUCLEO-F103RB의 대상 MCU(ID 0x410)를 인식했다. 대상 전압은 3.26 V였고, 0x08000000에 23.20 KB를 다운로드한 뒤 `Download verified successfully`를 확인했다. 로컬 ARM GCC 빌드와 링크도 완료했다. 실물 CAN 내부 루프백과 외부 CAN 송수신은 미확인이다.
 
 ## 2026-11-20 · 방향 입력 해제에 따른 모터 정지 구조 설계
 
