@@ -159,8 +159,7 @@ static void motorTask(void *argument)
         {
             phase = MOTOR_RUN;
             setPwm(timer, activeDirection, runCompare);
-        }void main_MotorControl(TIM_HandleTypeDef *timer)
-
+        }
         taskEXIT_CRITICAL();
         vTaskDelay(pdMS_TO_TICKS(5U));
     }

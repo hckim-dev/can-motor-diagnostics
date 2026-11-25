@@ -2,6 +2,13 @@
 
 의미 있는 작업을 마치면 [공통 양식](../../docs/development-history.md)에 따라 기록합니다.
 
+## 2026-11-25 · CAN 내부 루프백 시험 코드 반영
+
+- **담당·근거** — 권민지(모터 STM32), [`motor_mcu.ioc`](motor_mcu.ioc), [`main.c`](Core/Src/main.c)와 [`can_com.c`](Core/Src/can_com.c).
+- **문제** — 외부 CAN 장비 연결에 앞서 STM32가 보낸 프레임을 자체 수신하고 데이터가 일치하는지 확인할 방법이 필요했다. 빌드에 필요한 CMSIS-RTOS2 헤더와 모터 제어 선언도 정리해야 했다.
+- **판단과 변경** — CAN을 125 kbit/s 내부 루프백으로 설정하고, 시작 시 표준 ID `0x123`의 8바이트 시험 프레임을 송신해 FIFO0 수신값을 비교하도록 했다. 모터 제어 선언 오류를 수정하고 누락된 FreeRTOS 헤더를 추가했다.
+- **검증** — ARM GCC로 소스 36개를 컴파일하고 `motor_mcu.elf` 링크까지 완료했다. 이번 변경의 실물 CAN 내부 루프백과 외부 CAN 통신 검증은 미실행이다.
+
 ## 2026-11-24 · JP5 전원 선택 변경으로 ST-LINK 연결 복구
 
 - **담당·근거** — 권민지(모터 STM32), [전원 측정 사진과 디버그 기록](https://app.notion.com/p/4224894796bd8180bb42f93f4f1d25f9), CubeProgrammer v2.16.0 로그, `motor_mcu.ioc`와 HAL 초기화 코드.

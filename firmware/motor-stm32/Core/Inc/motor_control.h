@@ -8,9 +8,9 @@ typedef enum {
 	MOTOR_DIR_NONE = 0,
 	MOTOR_DIR_FORWARD,
 	MOTOR_DIR_REVERSE
-}MotorCommand;
+} MotorDirection;
 
-void MotorControl_OnPermint(bool allowed);
+void MotorControl_OnPermit(bool allowed);
 void MotorControl_OnDirection(MotorDirection direction);
 void MotorControl_UpdateLocalState(bool safeToDrive, bool IsStopped);
 void main_MotorControl(TIM_HandleTypeDef *timer);
